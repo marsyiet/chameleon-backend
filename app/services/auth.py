@@ -124,41 +124,49 @@ class AuthService:
                 "Invalid credentials",
                 401,
             )
-            
-        if (
-            user.get(
-                "lockedUntil"
-            )
-            and
-            user["lockedUntil"]
-            > datetime.utcnow()
-        ):
 
-            raise UnauthorizedException(
-                "Account locked",
-                423,
-            )
+        # Déverrouillage automatique si la durée est expirée
+        if user.get("lockedUntil"):
+
+            if (
+                user["lockedUntil"]
+                <= datetime.utcnow()
+            ):
+                UserRepository.update(
+                    str(user["_id"]),
+                    {
+                        "lockedUntil": None,
+                        "failedLoginAttempts": 0,
+                    },
+                )
+
+                user = (
+                    UserRepository.find_by_id(
+                        str(user["_id"])
+                    )
+                )
+
+            else:
+
+                raise UnauthorizedException(
+                    f"Account locked until: {user['lockedUntil'].isoformat()}",
+                    423,
+                )
 
         valid = bcrypt.checkpw(
             password.encode(),
-            user[
-                "password"
-            ].encode()
+            user["password"].encode()
         )
 
         if not valid:
 
             UserRepository.increment_failed_login(
-                str(
-                    user["_id"]
-                )
+                str(user["_id"])
             )
 
             refreshed_user = (
                 UserRepository.find_by_id(
-                    str(
-                        user["_id"]
-                    )
+                    str(user["_id"])
                 )
             )
 
@@ -171,15 +179,11 @@ class AuthService:
 
                 lock_until = (
                     datetime.utcnow()
-                    + timedelta(
-                        minutes=15
-                    )
+                    + timedelta(minutes=1)
                 )
 
                 UserRepository.lock_account(
-                    str(
-                        user["_id"]
-                    ),
+                    str(user["_id"]),
                     lock_until
                 )
 
@@ -195,7 +199,7 @@ class AuthService:
                 )
 
                 raise UnauthorizedException(
-                    "Account locked",
+                    f"Account locked until: {lock_until.isoformat()}",
                     423,
                 )
 
@@ -203,30 +207,20 @@ class AuthService:
                 "Invalid credentials",
                 401,
             )
-            
+
         UserRepository.reset_failed_login(
-            str(
-                user["_id"]
-            )
+            str(user["_id"])
         )
 
         access_token = (
             generate_access_token(
                 {
                     "userId":
-                        str(
-                            user["_id"]
-                        ),
-
+                        str(user["_id"]),
                     "organizationId":
-                        user[
-                            "organizationId"
-                        ],
-
+                        user["organizationId"],
                     "role":
-                        user[
-                            "role"
-                        ]
+                        user["role"],
                 }
             )
         )
@@ -235,20 +229,16 @@ class AuthService:
             generate_refresh_token(
                 {
                     "userId":
-                        str(
-                            user["_id"]
-                        )
+                        str(user["_id"])
                 }
             )
         )
 
         UserRepository.add_refresh_token(
-            str(
-                user["_id"]
-            ),
+            str(user["_id"]),
             refresh_token,
         )
-        
+
         AuditLogService.create(
             action="LOGIN",
             resource="auth",
@@ -263,7 +253,6 @@ class AuthService:
         return {
             "accessToken":
                 access_token,
-
             "refreshToken":
                 refresh_token,
         }

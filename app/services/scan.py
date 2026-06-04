@@ -28,7 +28,7 @@ class ScanService:
         )
 
         data["createdBy"] = (
-            g.user["id"]
+            g.user["userId"]
         )
 
         scan = Scan.build(

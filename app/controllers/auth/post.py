@@ -1,4 +1,8 @@
-from flask import request
+from flask import (
+    request,
+    g,
+    make_response,
+)
 
 from marshmallow import (
     ValidationError
@@ -6,22 +10,6 @@ from marshmallow import (
 
 from app.services.auth import (
     AuthService
-)
-
-from app.validators.auth import (
-    BootstrapSchema,
-    LoginSchema,
-    LogoutSchema,
-)
-
-from app.utils.api_response import (
-    success_response,
-    error_response,
-)
-
-from flask import (
-    request,
-    g,
 )
 
 from app.middlewares.auth import (
@@ -34,6 +22,12 @@ from app.validators.auth import (
     LogoutSchema,
     ChangePasswordSchema,
 )
+
+from app.utils.api_response import (
+    success_response,
+    error_response,
+)
+
 
 def bootstrap():
 
@@ -65,7 +59,8 @@ def bootstrap():
         result,
         201,
     )
-    
+
+
 def login():
 
     try:
@@ -92,39 +87,71 @@ def login():
         )
     )
 
-    return success_response(
-        "Login successful",
-        result
+    response = make_response(
+        success_response(
+            "Login successful"
+        )
     )
-    
+
+    response.set_cookie(
+        "access_token",
+        result["accessToken"],
+        httponly=True,
+        secure=False,  # True en production HTTPS
+        samesite="Lax",
+        path="/",
+    )
+
+    response.set_cookie(
+        "refresh_token",
+        result["refreshToken"],
+        httponly=True,
+        secure=False,  # True en production HTTPS
+        samesite="Lax",
+        path="/",
+    )
+
+    return response
+
+
 def logout():
 
-    try:
+    refresh_token = (
+        request.cookies.get(
+            "refresh_token"
+        )
+    )
 
-        data = (
-            LogoutSchema()
-            .load(
-                request.json
+    if refresh_token:
+
+        try:
+
+            AuthService.logout(
+                refresh_token
             )
+
+        except Exception:
+            pass
+
+    response = make_response(
+        success_response(
+            "Logout successful"
         )
-
-    except ValidationError as e:
-
-        return error_response(
-            "Validation error",
-            e.messages,
-            422
-        )
-
-    AuthService.logout(
-        data["refreshToken"]
     )
 
-    return success_response(
-        "Logout successful"
+    response.delete_cookie(
+        "access_token",
+        path="/",
     )
-    
-    
+
+    response.delete_cookie(
+        "refresh_token",
+        path="/",
+    )
+
+    return response
+
+
 @auth_required
 def change_password():
 

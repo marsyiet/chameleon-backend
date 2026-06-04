@@ -26,30 +26,16 @@ def auth_required(func):
         **kwargs
     ):
 
-        auth_header = request.headers.get(
-            "Authorization"
+        token = request.cookies.get(
+            "access_token"
         )
 
-        if not auth_header:
+        if not token:
 
             raise UnauthorizedException(
                 "Missing token",
                 401,
             )
-
-        if not auth_header.startswith(
-            "Bearer "
-        ):
-
-            raise UnauthorizedException(
-                "Invalid token",
-                401,
-            )
-
-        token = auth_header.replace(
-            "Bearer ",
-            ""
-        )
 
         payload = verify_token(
             token
@@ -68,9 +54,10 @@ def auth_required(func):
                 401,
             )
 
-        if user.get(
-            "status"
-        ) != "active":
+        if (
+            user.get("status")
+            != "active"
+        ):
 
             raise UnauthorizedException(
                 "Account disabled",

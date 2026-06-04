@@ -23,6 +23,14 @@ from app.routes.audit_log import (
     audit_log_bp,
 )
 
+from app.routes.scan import (
+    scan_bp,
+)
+
+from app.routes.asset import (
+    asset_bp,
+)
+
 load_dotenv()
 
 
@@ -38,11 +46,16 @@ def create_app():
         ).split(",")
         if origin.strip()
     ]
+    
+    print(allowed_origins)
 
     CORS(
-        app,
+    app,
         supports_credentials=True,
-        origins=allowed_origins,
+        origins=[
+            "http://localhost:3005",
+            "http://localhost:3006",
+        ],
     )
 
     register_error_handlers(app)
@@ -66,5 +79,16 @@ def create_app():
         audit_log_bp,
         url_prefix="/api/audit-logs",
     )
+    
+    app.register_blueprint(
+        scan_bp,
+        url_prefix="/api/scans",
+    )
+    
+    app.register_blueprint(
+        asset_bp,
+        url_prefix="/api/assets",
+    )
+            
 
     return app

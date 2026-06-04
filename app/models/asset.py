@@ -11,17 +11,49 @@ class Asset:
         return {
             "organizationId": data["organizationId"],
 
-            "assetType": data["assetType"],
+            "scanId": data.get(
+                "scanId"
+            ),
 
-            "value": data["value"],
+            "assetType": data[
+                "assetType"
+            ],
 
-            "firstSeenAt": now,
-            "lastSeenAt": now,
+            "value": data[
+                "value"
+            ],
 
-            "riskScore": 0,
+            "hostname": data.get(
+                "hostname"
+            ),
+
+            "ipAddress": data.get(
+                "ipAddress"
+            ),
+
+            "status": "active",
+
+            "country": None,
+
+            "city": None,
+
+            "asn": None,
+
+            "organization": None,
+
+            "openPorts": [],
+
+            "technologies": [],
 
             "tags": [],
 
+            "lastSeenAt": now,
+
+            "isDeleted": False,
+
+            "deletedAt": None,
+
             "createdAt": now,
+
             "updatedAt": now,
         }
