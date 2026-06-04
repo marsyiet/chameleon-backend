@@ -24,6 +24,11 @@ PERMISSIONS = {
 
         "user.unlock",
         "user.reset_password",
+        
+        "scan.create"
+        "scan.read",
+        "scan.update",
+        "scan.delete"
     ],
 
     "analyst": [
