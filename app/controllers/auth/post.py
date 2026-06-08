@@ -89,7 +89,8 @@ def login():
 
     response = make_response(
         success_response(
-            "Login successful"
+            "Login successful",
+            result
         )
     )
 
