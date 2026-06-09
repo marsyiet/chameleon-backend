@@ -1,0 +1,48 @@
+version: "3.9"
+ 
+services:
+ 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "5000:5000"
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+ 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file: .env
+    depends_on:
+      - redis
+    cap_add:
+      - NET_RAW      # obligatoire pour Masscan (raw sockets)
+      - NET_ADMIN
+    # network_mode: host  # décommenter si Masscan a des soucis réseau
+    volumes:
+      - .:/app
+      - /opt/geoip:/opt/geoip:ro  # base GeoLite2 en lecture seule
+ 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+ 
+  flower:    # Dashboard de monitoring Celery
+    image: mher/flower:2.0.0
+    ports:
+      - "5555:5555"
+    command: celery --broker=redis://redis:6379/0 flower
+    depends_on:
+      - redis
+ 
+volumes:
+  redis_data:

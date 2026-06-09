@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+ 
+# Outils de scan système
+RUN apt-get update && apt-get install -y \
+    masscan \
+    nmap \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+ 
+# ZGrab2
+RUN curl -L \
+    https://github.com/zmap/zgrab2/releases/latest/download/zgrab2_linux_amd64 \
+    -o /usr/local/bin/zgrab2 && chmod +x /usr/local/bin/zgrab2
+ 
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+ 
+COPY . .
+ 
+CMD ["celery", "-A", "engine.celery_app.celery_app", "worker",
+     "--loglevel=info", "--concurrency=4"]
