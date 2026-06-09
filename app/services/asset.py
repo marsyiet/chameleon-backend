@@ -40,47 +40,20 @@ class AssetService:
         )
 
     @staticmethod
-    def get_all(
-        page,
-        limit,
-        search
-    ):
-
+    def get_all(page, limit, search, scan_id=None):
         filters = {
-            "organizationId":
-                g.user[
-                    "organizationId"
-                ],
+            "organizationId": g.user["organizationId"],
             "isDeleted": False,
         }
-
         if search:
+            filters["value"] = {"$regex": search, "$options": "i"}
+        if scan_id:
+            filters["scanId"] = scan_id
 
-            filters["value"] = {
-                "$regex": search,
-                "$options": "i",
-            }
+        assets = AssetRepository.find_all(filters, page, limit)
+        total  = AssetRepository.count(filters)
+        return {"assets": assets, "page": page, "limit": limit, "total": total}
 
-        assets = (
-            AssetRepository.find_all(
-                filters,
-                page,
-                limit,
-            )
-        )
-
-        total = (
-            AssetRepository.count(
-                filters
-            )
-        )
-
-        return {
-            "assets": assets,
-            "page": page,
-            "limit": limit,
-            "total": total,
-        }
 
     @staticmethod
     def get_by_id(

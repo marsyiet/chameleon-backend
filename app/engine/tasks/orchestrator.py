@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 from bson import ObjectId
 from celery import group
-from engine.celery_app import celery_app
-from engine.tasks.masscan_task import scan_cidr
-from engine.tasks.nmap_task import scan_domain
-from models.db import get_db
+from app.engine.celery_app import celery_app
+from app.engine.tasks.masscan_task import scan_cidr
+from app.engine.tasks.nmap_task import scan_domain
+from app.models.db import get_db
  
  
 @celery_app.task(bind=True, name="engine.orchestrator.dispatch_scan")
@@ -58,6 +58,9 @@ def dispatch_scan(self, scan_id: str):
             )
  
         except Exception as e:
+            import traceback
+            print(f"[SCAN ERROR] target={target_val} error={e}")
+            print(traceback.format_exc())
             db.scans.update_one(
                 {"_id": ObjectId(scan_id), "targets.id": target_id},
                 {"$set": {"targets.$.status": "failed"}}

@@ -1,6 +1,6 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.database import Database
-from config import config
+from app.config.config import config
  
 _client: MongoClient = None
  

@@ -1,45 +1,25 @@
 from flask import g
-
 from bson import ObjectId
-
-from app.models.scan import (
-    Scan
-)
-
-from app.repositories.scan import (
-    ScanRepository
-)
-
-from app.utils.exceptions import (
-    NotFoundException,
-)
-
+from app.models.scan import Scan
+from app.repositories.scan import ScanRepository
+from app.utils.exceptions import NotFoundException
 from datetime import datetime
 
-
-
 class ScanService:
-
     @staticmethod
     def create(data):
+        data["organizationId"] = g.user["organizationId"]
+        data["createdBy"] = g.user["userId"]
+        scan = Scan.build(data)
+        scan_id = ScanRepository.create(scan)  # retourne déjà un str
 
-        data["organizationId"] = (
-            g.user["organizationId"]
+        from app.engine.tasks.orchestrator import dispatch_scan
+        dispatch_scan.apply_async(
+            args=[scan_id],
+            task_id=f"scan-{scan_id}"
         )
 
-        data["createdBy"] = (
-            g.user["userId"]
-        )
-
-        scan = Scan.build(
-            data
-        )
-
-        return (
-            ScanRepository.create(
-                scan
-            )
-        )
+        return scan_id
 
     @staticmethod
     def get_all(
@@ -190,4 +170,20 @@ class ScanService:
                 "updatedAt":
                     datetime.utcnow(),
             }
+        )
+
+
+    @staticmethod
+    def start_scan(scan_id):
+        from app.engine.tasks.orchestrator import dispatch_scan  # import local
+
+        scan = ScanRepository.find_by_id(scan_id)
+        if not scan:
+            raise NotFoundException("Scan not found", 404)
+        if scan["status"] not in ("pending", "failed"):
+            raise ValueError(f"Scan déjà en statut {scan['status']}")
+
+        dispatch_scan.apply_async(
+            args=[scan_id],
+            task_id=f"scan-{scan_id}"
         )

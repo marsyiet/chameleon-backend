@@ -29,45 +29,14 @@ from app.utils.mongo import (
     "asset.read"
 )
 def get_all():
+    page    = int(request.args.get("page", 1))
+    limit   = int(request.args.get("limit", 10))
+    search  = request.args.get("search")
+    scan_id = request.args.get("scanId")
 
-    page = int(
-        request.args.get(
-            "page",
-            1
-        )
-    )
-
-    limit = int(
-        request.args.get(
-            "limit",
-            10
-        )
-    )
-
-    search = request.args.get(
-        "search"
-    )
-
-    result = (
-        AssetService.get_all(
-            page,
-            limit,
-            search,
-        )
-    )
-
-    result[
-        "assets"
-    ] = serialize_documents(
-        result[
-            "assets"
-        ]
-    )
-
-    return success_response(
-        "Assets retrieved",
-        result,
-    )
+    result = AssetService.get_all(page, limit, search, scan_id)
+    result["assets"] = serialize_documents(result["assets"])
+    return success_response("Assets retrieved", result)
 
 
 @auth_required

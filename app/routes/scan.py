@@ -6,6 +6,7 @@ from app.controllers.scan import (
     get_by_id,
     update,
     delete,
+    start,
 )
 
 scan_bp = Blueprint(
@@ -38,3 +39,5 @@ scan_bp.delete(
 )(
     delete
 )
+
+scan_bp.post("/<scan_id>/start")(start)
