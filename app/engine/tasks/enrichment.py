@@ -5,11 +5,13 @@ from app.config.config import config
 
 def enrich_host(ip: str, nmap_data: dict) -> dict:
     return {
-        "geo":  _get_geoip(ip),
-        "asn":  _get_asn(ip),
-        "rdns": _get_rdns(ip),
-        "cves": _get_cves(nmap_data.get("services", [])),
-        "tags": _auto_tag(nmap_data.get("services", [])),
+        "geo":   _get_geoip(ip),
+        "asn":   _get_asn(ip),
+        "bgp":   _get_bgp(ip),      # ← nouveau
+        "whois": _get_whois(ip),    # ← nouveau
+        "rdns":  _get_rdns(ip),
+        "cves":  _get_cves(nmap_data.get("services", [])),
+        "tags":  _auto_tag(nmap_data.get("services", [])),
     }
 
 
@@ -90,6 +92,46 @@ def _get_cves(services: list) -> list:
 
     return cves
 
+def _get_bgp(ip: str) -> dict:
+    """Préfixes BGP via bgpview.io"""
+    try:
+        r = requests.get(
+            f"https://api.bgpview.io/ip/{ip}",
+            timeout=5
+        )
+        data = r.json().get("data", {})
+        prefixes = data.get("prefixes", [])
+        if not prefixes:
+            return {}
+        p = prefixes[0]
+        return {
+            "prefix":      p.get("prefix"),
+            "asn":         p.get("asn", {}).get("asn"),
+            "asn_name":    p.get("asn", {}).get("name"),
+            "asn_country": p.get("asn", {}).get("country_code"),
+            "description": p.get("description"),
+        }
+    except Exception:
+        return {}
+
+
+def _get_whois(ip: str) -> dict:
+    """WHOIS via python-whois"""
+    try:
+        import ipwhois
+        obj = ipwhois.IPWhois(ip)
+        result = obj.lookup_rdap(depth=1)
+        return {
+            "name":    result.get("network", {}).get("name"),
+            "country": result.get("network", {}).get("country"),
+            "abuse":   next(iter([
+                e.get("email") for e in result.get("objects", {}).values()
+                if "abuse" in str(e.get("roles", [])).lower()
+                and e.get("contact", {}).get("email")
+            ]), None),
+        }
+    except Exception:
+        return {}
 
 TAGS_MAP = {
     21:    "ftp",
