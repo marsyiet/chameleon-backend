@@ -3,12 +3,9 @@ from marshmallow import (
     fields,
     validate,
 )
-
-
 class ScanTargetSchema(
     Schema
 ):
-
     target = fields.String(
         required=True,
         validate=validate.Length(
@@ -16,7 +13,6 @@ class ScanTargetSchema(
             max=255
         )
     )
-
     targetType = fields.String(
         required=True,
         validate=validate.OneOf(
@@ -27,12 +23,15 @@ class ScanTargetSchema(
             ]
         )
     )
-
-
+    # Rattachement manuel de site (chapitre 2, §2.1.4) — pertinent surtout
+    # pour une cible de type IP/CIDR privée, non géolocalisable automatiquement.
+    siteId = fields.String(
+        required=False,
+        allow_none=True,
+    )
 class CreateScanSchema(
     Schema
 ):
-
     name = fields.String(
         required=True,
         validate=validate.Length(
@@ -40,14 +39,12 @@ class CreateScanSchema(
             max=100
         )
     )
-
     description = fields.String(
         allow_none=True,
         validate=validate.Length(
             max=500
         )
     )
-
     scanType = fields.String(
         required=True,
         validate=validate.OneOf(
@@ -58,7 +55,18 @@ class CreateScanSchema(
             ]
         )
     )
-
+    scheduledAt = fields.DateTime(
+        required=False,
+        allow_none=True,
+        format="iso",
+    )
+    # Structure auditée par ce scan (ex: "MINFI") — simple texte, pas de
+    # référence à une collection Organization pour l'instant.
+    targetOrganization = fields.String(
+        required=False,
+        allow_none=True,
+        validate=validate.Length(max=100),
+    )
     targets = fields.List(
         fields.Nested(
             ScanTargetSchema
@@ -68,26 +76,21 @@ class CreateScanSchema(
             min=1
         )
     )
-
-
 class UpdateScanSchema(
     Schema
 ):
-
     name = fields.String(
         validate=validate.Length(
             min=3,
             max=100
         )
     )
-
     description = fields.String(
         allow_none=True,
         validate=validate.Length(
             max=500
         )
     )
-
     scanType = fields.String(
         validate=validate.OneOf(
             [
@@ -97,17 +100,15 @@ class UpdateScanSchema(
             ]
         )
     )
-
-
 class UpdateScanStatusSchema(
     Schema
 ):
-
     status = fields.String(
         required=True,
         validate=validate.OneOf(
             [
                 "pending",
+                "scheduled",
                 "running",
                 "completed",
                 "failed",
@@ -115,54 +116,3 @@ class UpdateScanStatusSchema(
             ]
         )
     )
-    
-
-# ============================================================
-# CREATE SCAN PAYLOAD
-# ============================================================
-#
-# {
-#   "name": "External Attack Surface",
-#   "description": "Production infrastructure",
-#   "scanType": "network",
-#   "targets": [
-#     {
-#       "target": "192.168.1.0/24",
-#       "targetType": "cidr"
-#     },
-#     {
-#       "target": "10.0.0.0/24",
-#       "targetType": "cidr"
-#     },
-#     {
-#       "target": "8.8.8.8",
-#       "targetType": "ip"
-#     },
-#     {
-#       "target": "example.com",
-#       "targetType": "domain"
-#     }
-#   ]
-# }
-#
-# ============================================================
-# UPDATE SCAN PAYLOAD
-# ============================================================
-#
-# {
-#   "name": "Updated Scan Name",
-#   "description": "Updated description",
-#   "scanType": "full"
-# }
-#
-# ============================================================
-# UPDATE SCAN STATUS PAYLOAD
-# ============================================================
-#
-# {
-#   "status": "running"
-# }
-#
-# Status:
-# pending | running | completed | failed | cancelled
-# ============================================================

@@ -13,7 +13,7 @@ def fingerprint_host(host: str, ports: list) -> dict:
         "-Pn",
         "-sV",
         "-sC",
-        "--script", "mysql-info,pgsql-brute",
+        "--script", "mysql-info,pgsql-brute,mongodb-databases,redis-info",
         "-O",
         "--open",
         "-T4",
@@ -89,6 +89,26 @@ def _parse_nmap_xml(xml_output: str) -> dict:
                             version = match.group(1)
                         break
 
+                    # mongodb-databases : la sortie liste les bases si l'accès
+                    # est possible SANS authentification — signal de risque
+                    # au moins aussi important que la version elle-même.
+                    if "mongod" in output.lower() or "MongoDB" in output:
+                        product = "MongoDB"
+                        if "ERROR" not in output and "requires authentication" not in output.lower():
+                            banner = "accès sans authentification possible"
+                        match = re.search(r"version[:\s]+([\d.]+)", output, re.IGNORECASE)
+                        if match:
+                            version = match.group(1)
+                        break
+
+                    # redis-info renvoie généralement "redis_version:X.X.X"
+                    if "redis_version" in output:
+                        product = "Redis"
+                        match = re.search(r"redis_version:\s*([\d.]+)", output)
+                        if match:
+                            version = match.group(1)
+                        break
+
             services.append({
                 "port":     svc.port,
                 "protocol": svc.protocol,
@@ -109,10 +129,9 @@ def _parse_nmap_xml(xml_output: str) -> dict:
     return {"services": services, "os": os_info}
 
 
-def scan_domain(scan_id: str, target_id: str, domain: str):
+def scan_domain(scan_id: str, target_id: str, domain: str, site_id: str = None):
     import socket
-    from app.engine.tasks.enrichment import enrich_host
-    from app.engine.tasks.masscan_task import _save_asset
+    from app.engine.tasks.masscan_task import _process_host
 
     try:
         ip = socket.gethostbyname(domain)
@@ -120,7 +139,15 @@ def scan_domain(scan_id: str, target_id: str, domain: str):
         print(f"[DNS ERROR] {domain}")
         return
 
-    common_ports = [21, 22, 25, 80, 443, 3000, 3306, 5432, 6379, 8080, 8443, 27017]
-    nmap_data = fingerprint_host(ip, common_ports)
-    enriched  = enrich_host(ip, nmap_data)
-    _save_asset(scan_id, ip, common_ports, nmap_data, enriched)
+    common_ports = [
+        21, 22, 23, 25, 80, 110, 143, 161, 443,
+        3000, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017,
+    ]
+
+    # Réutilise exactement le même traitement que scan_cidr (nmap + zgrab http/tls
+    # + favicon + crawler + scoring) au lieu de dupliquer une version incomplète —
+    # c'est ce qui manquait avant (zgrab n'était jamais appelé ici).
+    _process_host(
+        scan_id, ip, common_ports,
+        target_type="domain", domain=domain, site_id=site_id,
+    )
