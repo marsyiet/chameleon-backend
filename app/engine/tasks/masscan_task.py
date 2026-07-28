@@ -12,6 +12,7 @@ from app.engine.tasks.nmap_task import fingerprint_host
 from app.engine.tasks.enrichment import enrich_host
 from app.engine.tasks.zgrab_task import zgrab_http, zgrab_tls, fetch_favicon
 from app.engine.tasks.crawler_task import crawl_site
+from app.engine.tasks.nature_detection import derive_service_nature, derive_asset_nature
 from app.engine.scoring import calculate_risk_score
 from app.models.asset import Asset
 from app.models.db import get_db
@@ -20,9 +21,10 @@ DEFAULT_PORTS = (
     "21,22,23,25,53,80,110,143,161,443,445,993,995,"
     "3000,3005,3006,3306,3389,5000,5432,5900,6379,8080,8443,27017"
 )
+UDP_PORTS = "161,500,4500"
 
 HTTP_PORTS = [80, 443, 3000, 3005, 3006, 5000, 8080, 8443]
-WEB_LIKE_TYPES = ("web", "api", "authentication")
+LOGIN_CHECK_NATURES = ("web_application", "authentication_portal", "firewall_router", "vpn_gateway")
 
 MASSCAN_BASE_RATE = "300"
 JITTER_MIN_SECONDS = 0.3
@@ -30,17 +32,21 @@ JITTER_MAX_SECONDS = 1.2
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_COOLDOWN_SECONDS = 30
 
-# Fournisseurs PaaS/CDN/cloud connus (mot-clé dans asn.org ou product) pour
-# lesquels un OS fingerprint TCP/IP (Nmap -O) ne représente pas l'app réelle
-# mais l'infra d'edge/load-balancing du fournisseur — donc trompeur à garder tel quel.
 PAAS_ASN_KEYWORDS = [
     "vercel", "netlify", "cloudflare", "fastly", "akamai",
     "amazon", "google", "microsoft", "digitalocean", "heroku",
 ]
 
 
-def scan_cidr(scan_id: str, target_id: str, cidr: str, site_id: str = None):
-    open_hosts = _run_masscan(cidr)
+def scan_cidr(scan_id: str, target_id: str, cidr: str, site_id: str = None, organization_id: str = None):
+    open_hosts_tcp = _run_masscan(cidr, DEFAULT_PORTS, udp=False)
+    open_hosts_udp = _run_masscan(cidr, UDP_PORTS, udp=True)
+
+    open_hosts = {}
+    for ip, ports in open_hosts_tcp.items():
+        open_hosts.setdefault(ip, {"tcp": [], "udp": []})["tcp"] = ports
+    for ip, ports in open_hosts_udp.items():
+        open_hosts.setdefault(ip, {"tcp": [], "udp": []})["udp"] = ports
 
     print("[OPEN HOSTS]")
     print(open_hosts)
@@ -54,6 +60,7 @@ def scan_cidr(scan_id: str, target_id: str, cidr: str, site_id: str = None):
             _process_host(
                 scan_id, host_ip, ports,
                 target_type="cidr", domain=None, site_id=site_id,
+                organization_id=organization_id,
             )
             consecutive_failures = 0
         except Exception as e:
@@ -68,55 +75,91 @@ def scan_cidr(scan_id: str, target_id: str, cidr: str, site_id: str = None):
                 consecutive_failures = 0
 
 
-def _process_host(scan_id, host_ip, ports, target_type, domain, site_id):
-    nmap_data = fingerprint_host(host_ip, ports)
+def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organization_id=None):
+    tcp_ports = ports.get("tcp", []) if isinstance(ports, dict) else ports
+    udp_ports = ports.get("udp", []) if isinstance(ports, dict) else []
+
+    nmap_data = fingerprint_host(host_ip, tcp_ports)
     enriched = enrich_host(host_ip, nmap_data)
 
-    # Cible pour les requêtes HTTP/TLS/crawl : hostname si connu (scan
-    # organisationnel), sinon rDNS résolu par l'enrichissement comme
-    # candidat de secours, sinon l'IP nue en dernier recours.
-    # C'EST CE CHAMP QUI CORRIGE LE BUG VERCEL : avant, on utilisait
-    # systématiquement host_ip, donc sur un hébergeur mutualisé on tombait
-    # sur le vhost par défaut au lieu du vrai site.
     web_target = domain or enriched.get("rdns") or host_ip
-
     services = enriched.get("services", nmap_data.get("services", []))
 
-    http_data = {}
-    tls_data = {}
-    crawl_data = {}
-    favicon_data = {}
+    # Ports UDP détectés mais non fingerprintés par Nmap TCP — ajoutés tels
+    # quels, avec une identification minimale par port connu.
+    for udp_port in udp_ports:
+        if not any(s.get("port") == udp_port and s.get("protocol") == "udp" for s in services):
+            services.append({
+                "port": udp_port, "protocol": "udp", "state": "open",
+                "service": "isakmp" if udp_port in (500, 4500) else "unknown",
+                "product": "", "version": "", "banner": "",
+                "cves": [], "productConfirmed": False,
+            })
 
-    http_port = next(
-        (s.get("port") for s in services if s.get("port") in HTTP_PORTS),
-        None,
-    )
-
-    if http_port:
-        http_data = zgrab_http(web_target, http_port)
-        use_https = http_port in (443, 8443)
-        if use_https:
-            tls_data = zgrab_tls(web_target, http_port)
-        favicon_data = fetch_favicon(web_target, http_port, use_https)
-
-    provisional_type = Asset.derive_asset_type(
-        [s.get("service", "") for s in services]
-    )
-
-    if http_port and provisional_type in WEB_LIKE_TYPES:
-        crawl_data = crawl_site(web_target, http_port, http_port in (443, 8443))
-
-    # Neutralisation de l'OS fingerprint sur PaaS/cloud connu (chapitre 3,
-    # limite à documenter : le fingerprint TCP/IP d'un edge Vercel/Cloudflare
-    # ne renseigne pas sur l'application réelle).
     is_paas = _is_paas_hosting(enriched, services)
     os_value = None if is_paas else nmap_data.get("os")
 
+    # ── Enrichissement PAR SERVICE : http/tls/nature propres à chaque port,
+    # corrige le bug où un seul bloc http/tls global écrasait les données
+    # d'un service par un autre sur le même actif. ──
+    enriched_services = []
+    for svc in services:
+        svc_http = None
+        svc_tls = None
+
+        if svc["protocol"] == "tcp" and svc.get("port") in HTTP_PORTS:
+            http_port = svc["port"]
+            svc_http = zgrab_http(web_target, http_port)
+            use_https = http_port in (443, 8443)
+            if use_https:
+                svc_tls = zgrab_tls(web_target, http_port)
+            favicon_data = fetch_favicon(web_target, http_port, use_https)
+            if favicon_data:
+                svc_http = svc_http or {}
+                svc_http["faviconUrl"] = favicon_data.get("faviconUrl")
+                svc_http["faviconHash"] = favicon_data.get("faviconHash")
+
+        nature = derive_service_nature(
+            port=svc.get("port"), service_name=svc.get("service"),
+            http_data=svc_http, snmp_data=None,
+        )
+
+        if svc_http is not None and nature["natureType"] in LOGIN_CHECK_NATURES:
+            http_port = svc["port"]
+            use_https = http_port in (443, 8443)
+            crawl_data = crawl_site(web_target, http_port, use_https)
+            svc_http["technologies"] = crawl_data.get("technologies", [])
+            svc_http["loginPoints"] = crawl_data.get("loginPoints", [])
+            svc_http["contactForms"] = crawl_data.get("contactForms", [])
+            # Re-dérive la nature avec les nouveaux signaux (login form trouvé)
+            nature = derive_service_nature(
+                port=svc.get("port"), service_name=svc.get("service"),
+                http_data=svc_http, snmp_data=None,
+            )
+
+        enriched_services.append(
+            Asset.build_service({
+                **svc,
+                "http": svc_http,
+                "tls": svc_tls,
+                "natureType": nature["natureType"],
+                "vendorGuess": nature["vendorGuess"],
+                "natureConfidence": nature["natureConfidence"],
+                "natureSignals": nature["natureSignals"],
+            })
+        )
+
+    asset_nature = derive_asset_nature([
+        {"natureType": s["natureType"], "vendorGuess": s["vendorGuess"],
+         "natureConfidence": s["natureConfidence"], "natureSignals": s["natureSignals"]}
+        for s in enriched_services
+    ])
+
     _save_asset(
-        scan_id, host_ip, ports, nmap_data, enriched,
-        http_data=http_data, tls_data=tls_data, crawl_data=crawl_data,
-        favicon_data=favicon_data, os_override=os_value, is_paas=is_paas,
+        scan_id, host_ip, enriched_services, nmap_data, enriched,
+        asset_nature=asset_nature, os_override=os_value, is_paas=is_paas,
         target_type=target_type, domain=domain, site_id=site_id,
+        organization_id=organization_id,
     )
 
 
@@ -131,13 +174,15 @@ def _is_paas_hosting(enriched, services) -> bool:
     return False
 
 
-def _run_masscan(cidr: str) -> dict:
+def _run_masscan(cidr: str, ports: str, udp: bool = False) -> dict:
     out_file = tempfile.mktemp(suffix=".json")
 
-    cmd = [
-        "masscan",
-        cidr,
-        "-p", DEFAULT_PORTS,
+    cmd = ["masscan", cidr]
+    if udp:
+        cmd += ["-pU:" + ports]
+    else:
+        cmd += ["-p", ports]
+    cmd += [
         "--rate", MASSCAN_BASE_RATE,
         "--output-format", "json",
         "--output-filename", out_file,
@@ -160,7 +205,7 @@ def _run_masscan(cidr: str) -> dict:
         return {}
 
     hosts = _parse_masscan_output(out_file)
-    print("[MASSCAN PARSED]")
+    print(f"[MASSCAN PARSED {'UDP' if udp else 'TCP'}]")
     print(hosts)
     return hosts
 
@@ -191,32 +236,26 @@ def _parse_masscan_output(filepath: str) -> dict:
 
 
 def _save_asset(
-    scan_id, ip, ports, nmap_data, enriched,
-    http_data=None, tls_data=None, crawl_data=None, favicon_data=None,
-    os_override=None, is_paas=False,
-    target_type="cidr", domain=None, site_id=None,
+    scan_id, ip, services, nmap_data, enriched,
+    asset_nature=None, os_override=None, is_paas=False,
+    target_type="cidr", domain=None, site_id=None, organization_id=None,
 ):
     db = get_db()
     now = datetime.utcnow()
 
     scan = db.scans.find_one({"_id": ObjectId(scan_id)})
+    organization_id = organization_id or (scan.get("organizationId") if scan else None)
 
-    services = enriched.get("services", nmap_data.get("services", []))
-    asset_type = Asset.derive_asset_type([svc.get("service", "") for svc in services])
-
-    organization_id = None
     attribution = {"guessedOrganizationName": None, "confidence": "inconnue", "signals": []}
 
-    # Propagation directe : si la structure auditée a été déclarée sur le scan
-    # (ex: "MINFI"), tous les actifs qu'il découvre lui sont rattachés — que
-    # le seed soit un domaine ou une plage CIDR. Sinon, tentative d'attribution
-    # automatique (carte nationale, chapitre 2 §2.1.4), qui reste une estimation.
-    target_organization = scan.get("targetOrganization") if scan else None
+    # Structure auditée déclarée sur le scan (résolue à la création du scan,
+    # cf. Scan.build) — distincte de organizationId (propriétaire du scan).
+    target_organization_id = scan.get("targetOrganizationId") if scan else None
+    target_organization_name = scan.get("targetOrganizationName") if scan else None
 
-    if target_organization:
-        organization_id = target_organization
+    if target_organization_name:
         attribution = {
-            "guessedOrganizationName": target_organization,
+            "guessedOrganizationName": target_organization_name,
             "confidence": "certaine",
             "signals": ["declared"],
         }
@@ -235,19 +274,13 @@ def _save_asset(
                 "signals": signals,
             }
 
-    http_block = dict(http_data or {})
-    if crawl_data:
-        http_block["technologies"] = crawl_data.get("technologies", [])
-        http_block["loginPoints"] = crawl_data.get("loginPoints", [])
-        http_block["contactForms"] = crawl_data.get("contactForms", [])
-    if favicon_data:
-        http_block["faviconUrl"] = favicon_data.get("faviconUrl")
-        http_block["faviconHash"] = favicon_data.get("faviconHash")
-
-    human_vector_exposed = bool(http_block.get("loginPoints"))
+    human_vector_exposed = any(
+        bool((svc.get("http") or {}).get("loginPoints")) for svc in services
+    )
 
     risk_score, severity = calculate_risk_score(
-        asset_type, Asset._derive_exposure(ip), services, human_vector_exposed,
+        asset_nature["natureType"] if asset_nature else "unknown",
+        Asset._derive_exposure(ip), services, human_vector_exposed,
     )
 
     tags = list(enriched.get("tags", []))
@@ -264,7 +297,10 @@ def _save_asset(
                 "ipAddress":      ip,
                 "hostname":       domain,
                 "rootDomain":     domain,
-                "assetType":      asset_type,
+                "natureType":       asset_nature["natureType"] if asset_nature else "unknown",
+                "natureConfidence": asset_nature["natureConfidence"] if asset_nature else "faible",
+                "natureSignals":    asset_nature["natureSignals"] if asset_nature else [],
+                "vendorGuess":      asset_nature["vendorGuess"] if asset_nature else None,
                 "exposure":       Asset._derive_exposure(ip),
                 "humanVector": {
                     "exposed": human_vector_exposed,
@@ -274,15 +310,13 @@ def _save_asset(
                 "severity":        severity,
                 "riskScore":       risk_score,
                 "services":        services,
-                # None si is_paas (fingerprint TCP/IP non pertinent sur edge PaaS)
                 "os":              os_override if os_override is not None else nmap_data.get("os"),
                 "geo":             enriched.get("geo", {}),
                 "asn":             enriched.get("asn", {}),
+                "bgp":             enriched.get("bgp", {}),
                 "rdns":            enriched.get("rdns", ""),
                 "attribution":     attribution,
                 "tags":            tags,
-                "http":            http_block,
-                "tls":             tls_data or {},
                 "lastSeenAt":      now,
                 "isDeleted":       False,
                 "deletedAt":       None,

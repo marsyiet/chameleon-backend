@@ -8,22 +8,106 @@ from app.config.config import config
 # fournisseur patche/mitige lui-même côté plateforme).
 PAAS_PRODUCTS = ["vercel", "netlify", "heroku", "render", "cloudflare pages"]
 
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+# Cache en mémoire du process worker — le catalogue KEV compte plusieurs
+# milliers d'entrées et change peu dans la journée ; le retélécharger à
+# chaque host scanné serait un gaspillage de bande passante et de temps.
+_kev_cache = {"ids": None, "fetched_at": None}
+KEV_CACHE_TTL_SECONDS = 6 * 3600  # 6h
+
+
+def _get_kev_ids() -> set:
+    import time
+    now = time.time()
+
+    if _kev_cache["ids"] is not None and (now - _kev_cache["fetched_at"]) < KEV_CACHE_TTL_SECONDS:
+        return _kev_cache["ids"]
+
+    try:
+        r = requests.get(CISA_KEV_URL, timeout=10)
+        data = r.json()
+        ids = {v.get("cveID") for v in data.get("vulnerabilities", []) if v.get("cveID")}
+        _kev_cache["ids"] = ids
+        _kev_cache["fetched_at"] = now
+        return ids
+    except Exception as e:
+        print("[CISA KEV ERROR]", e)
+        # En cas d'échec, on retombe sur l'ancien cache s'il existe, plutôt
+        # que de perdre l'information sur tous les actifs du scan en cours.
+        return _kev_cache["ids"] or set()
+
 
 def enrich_host(ip: str, nmap_data: dict) -> dict:
     services_with_cves = _attach_cves(nmap_data.get("services", []))
     services_with_epss = _attach_epss(services_with_cves)
+    services_with_kev = _attach_kev(services_with_epss)
+
+    geo, asn = _get_geoip_and_asn(ip)
+
     return {
-        "geo":      _get_geoip(ip),
-        "asn":      _get_asn(ip),
+        "geo":      geo,
+        "asn":      asn,
         "bgp":      _get_bgp(ip),
         "whois":    _get_whois(ip),
         "rdns":     _get_rdns(ip),
-        "services": services_with_epss,
+        "services": services_with_kev,
         "tags":     _auto_tag(nmap_data.get("services", [])),
     }
 
 
+def _attach_kev(services: list) -> list:
+    kev_ids = _get_kev_ids()
+    if not kev_ids:
+        return services
+
+    for svc in services:
+        for cve in svc.get("cves", []):
+            cve["kev"] = cve.get("id") in kev_ids
+
+    return services
+
+
+def _get_geoip_and_asn(ip: str) -> tuple:
+    """
+    Un seul appel ipinfo.io fournit à la fois géolocalisation et ASN, avec
+    une précision généralement meilleure que GeoLite2 gratuit sur les plages
+    IP africaines (cf. discussion, chapitre 3 : GeoLite2 retombe souvent sur
+    le centroïde national, rayon ~1000km, faute de données ville pour ces
+    plages). MaxMind reste utilisé en secours si ipinfo.io échoue.
+    """
+    geo, asn = {}, {}
+    try:
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
+        data = r.json()
+
+        org_raw = data.get("org", "")
+        asn = {
+            "asn": org_raw.split(" ")[0] if org_raw else None,
+            "org": " ".join(org_raw.split(" ")[1:]) if org_raw else None,
+            "isp": org_raw or None,
+        }
+
+        loc = data.get("loc", "")
+        if loc and "," in loc:
+            lat_str, lon_str = loc.split(",")
+            geo = {
+                "country": data.get("country", ""),
+                "city": data.get("city", ""),
+                "lat": float(lat_str),
+                "lon": float(lon_str),
+            }
+    except Exception:
+        pass
+
+    if not geo:
+        geo = _get_geoip(ip)
+
+    return geo, asn
+
+
 def _get_geoip(ip: str) -> dict:
+    """Repli MaxMind (GeoLite2 local) si ipinfo.io n'a rien retourné."""
     try:
         import maxminddb
         with maxminddb.open_database(config.GEOIP_DB_PATH) as reader:
@@ -36,19 +120,6 @@ def _get_geoip(ip: str) -> dict:
                 "lat":     record.get("location", {}).get("latitude"),
                 "lon":     record.get("location", {}).get("longitude"),
             }
-    except Exception:
-        return {}
-
-
-def _get_asn(ip: str) -> dict:
-    try:
-        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
-        data = r.json()
-        return {
-            "asn": data.get("org", "").split(" ")[0],
-            "org": " ".join(data.get("org", "").split(" ")[1:]),
-            "isp": data.get("org", ""),
-        }
     except Exception:
         return {}
 
@@ -127,11 +198,6 @@ def _attach_cves(services: list) -> list:
     enriched_services = []
 
     for svc in services:
-        # BUG CORRIGÉ : avant, on retombait sur svc["service"] (le nom
-        # générique du port, ex: "https", "redis") quand Nmap ne confirmait
-        # pas de produit précis. Chercher un mot générique dans l'API NVD
-        # (recherche texte libre) remonte des CVE sans aucun rapport réel
-        # avec le service détecté — c'est ce qui polluait riskScore.
         product = svc.get("product", "")
         version = (svc.get("version", "") or "").replace("for_Windows_", "")
 
@@ -168,15 +234,12 @@ def _attach_cves(services: list) -> list:
                             .get("baseScore")
                         ),
                         "epss": None,
-                        # valid | mitigated (exclue du scoring, gardée pour transparence)
+                        "kev": False,
                         "status": status,
                     })
             except Exception:
                 pass
 
-        # Pas de produit confirmé -> pas de recherche CVE ; on garde une trace
-        # explicite que l'identification est incomplète, plutôt que de laisser
-        # croire que "cves: []" veut dire "vérifié, rien trouvé".
         enriched_services.append({
             **svc,
             "cves": cves,
@@ -265,6 +328,7 @@ TAGS_MAP = {
     161:   "network/snmp",
     443:   "web/https",
     445:   "windows/smb",
+    500:   "vpn/ike",
     554:   "camera/rtsp",
     993:   "mail/imaps",
     995:   "mail/pop3s",
@@ -272,6 +336,7 @@ TAGS_MAP = {
     2375:  "container/docker",
     3306:  "database/mysql",
     3389:  "remote/rdp",
+    4500:  "vpn/ike-natt",
     5432:  "database/postgresql",
     5900:  "remote/vnc",
     6379:  "database/redis",

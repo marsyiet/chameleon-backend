@@ -3,9 +3,12 @@ from marshmallow import (
     fields,
     validate,
 )
+
+
 class ScanTargetSchema(
     Schema
 ):
+
     target = fields.String(
         required=True,
         validate=validate.Length(
@@ -13,6 +16,7 @@ class ScanTargetSchema(
             max=255
         )
     )
+
     targetType = fields.String(
         required=True,
         validate=validate.OneOf(
@@ -23,15 +27,12 @@ class ScanTargetSchema(
             ]
         )
     )
-    # Rattachement manuel de site (chapitre 2, §2.1.4) — pertinent surtout
-    # pour une cible de type IP/CIDR privée, non géolocalisable automatiquement.
-    siteId = fields.String(
-        required=False,
-        allow_none=True,
-    )
+
+
 class CreateScanSchema(
     Schema
 ):
+
     name = fields.String(
         required=True,
         validate=validate.Length(
@@ -39,12 +40,14 @@ class CreateScanSchema(
             max=100
         )
     )
+
     description = fields.String(
         allow_none=True,
         validate=validate.Length(
             max=500
         )
     )
+
     scanType = fields.String(
         required=True,
         validate=validate.OneOf(
@@ -55,18 +58,7 @@ class CreateScanSchema(
             ]
         )
     )
-    scheduledAt = fields.DateTime(
-        required=False,
-        allow_none=True,
-        format="iso",
-    )
-    # Structure auditée par ce scan (ex: "MINFI") — simple texte, pas de
-    # référence à une collection Organization pour l'instant.
-    targetOrganization = fields.String(
-        required=False,
-        allow_none=True,
-        validate=validate.Length(max=100),
-    )
+
     targets = fields.List(
         fields.Nested(
             ScanTargetSchema
@@ -76,21 +68,42 @@ class CreateScanSchema(
             min=1
         )
     )
+
+    # Désormais un ObjectId (chaîne) d'organisation existante, plus un nom
+    # libre tapé à la main — sélectionné parmi les organisations réelles
+    # côté frontend (Select alimenté par GET /organizations).
+    targetOrganization = fields.String(
+        allow_none=True,
+        validate=validate.Length(
+            min=1,
+            max=100
+        )
+    )
+
+    scheduledAt = fields.DateTime(
+        allow_none=True,
+        format="iso"
+    )
+
+
 class UpdateScanSchema(
     Schema
 ):
+
     name = fields.String(
         validate=validate.Length(
             min=3,
             max=100
         )
     )
+
     description = fields.String(
         allow_none=True,
         validate=validate.Length(
             max=500
         )
     )
+
     scanType = fields.String(
         validate=validate.OneOf(
             [
@@ -100,15 +113,17 @@ class UpdateScanSchema(
             ]
         )
     )
+
+
 class UpdateScanStatusSchema(
     Schema
 ):
+
     status = fields.String(
         required=True,
         validate=validate.OneOf(
             [
                 "pending",
-                "scheduled",
                 "running",
                 "completed",
                 "failed",

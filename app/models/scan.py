@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from bson import ObjectId
+from app.models.db import get_db
 
 
 class Scan:
@@ -9,26 +10,30 @@ class Scan:
 
         scheduled_at = data.get("scheduledAt")
 
-        # Cas 1 : marshmallow a déjà converti en datetime (timezone-aware si "Z"/offset présent)
         if isinstance(scheduled_at, str):
             scheduled_at = datetime.fromisoformat(
                 scheduled_at.replace("Z", "+00:00")
             )
 
-        if scheduled_at is not None and scheduled_at.tzinfo is not None:
-            # On uniformise en UTC naive pour rester comparable à datetime.utcnow()
-            # et cohérent avec le reste du document (createdAt, updatedAt en naive UTC).
+        if isinstance(scheduled_at, datetime) and scheduled_at.tzinfo is not None:
+            from datetime import timezone
             scheduled_at = scheduled_at.astimezone(timezone.utc).replace(tzinfo=None)
 
         is_scheduled = bool(scheduled_at) and scheduled_at > now
 
+        # targetOrganization est désormais un vrai organizationId (sélectionné
+        # parmi les organisations existantes) — on résout son nom une seule
+        # fois ici, à la création du scan, plutôt que de le refaire à chaque
+        # actif découvert dans masscan_task.py.
+        target_organization_id = data.get("targetOrganization")
+        target_organization_name = None
+        if target_organization_id:
+            db = get_db()
+            org = db.organizations.find_one({"_id": ObjectId(target_organization_id)})
+            target_organization_name = org["name"] if org else None
+
         return {
             "organizationId": data["organizationId"],
-            # Structure auditée par ce scan (ex: "MINFI") — distincte de
-            # organizationId ci-dessus, qui reste le compte ANTIC/CIRT créateur
-            # du scan. C'est CE champ qui se propage aux actifs découverts,
-            # pas organizationId (chapitre 2, §2.1.4 — carte organisationnelle).
-            "targetOrganization": data.get("targetOrganization"),
             "name": data["name"].strip(),
             "description": data.get(
                 "description"
@@ -40,7 +45,6 @@ class Scan:
                     "id": str(ObjectId()),
                     "target": target["target"],
                     "targetType": target["targetType"],
-                    "siteId": target.get("siteId"),
                     "status": "pending",
                     "startedAt": None,
                     "completedAt": None,
@@ -50,7 +54,6 @@ class Scan:
             # pending | scheduled | running | completed | failed | cancelled
             "status": "scheduled" if is_scheduled else "pending",
             "scheduledAt": scheduled_at if is_scheduled else None,
-            "priority": 0,
             # 0 -> 100
             "progress": 0,
 
@@ -59,6 +62,13 @@ class Scan:
             "startedAt": None,
             "completedAt": None,
             "createdBy": data["createdBy"],
+
+            # Organisation-cible du scan (structure auditée) — id + nom
+            # résolu. Distinct de "organizationId" ci-dessus (l'organisation
+            # ANTIC/utilisateur propriétaire du scan).
+            "targetOrganizationId": target_organization_id,
+            "targetOrganizationName": target_organization_name,
+
             "isDeleted": False,
             "deletedAt": None,
             "createdAt": now,

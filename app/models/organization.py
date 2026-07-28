@@ -8,19 +8,20 @@ class Organization:
         now = datetime.utcnow()
         return {
             "name": data["name"],
-            "description": data.get(
-                "description"
-            ),
-            "sector": data.get(
-                "sector"
-            ),
+            "description": data.get("description"),
+            "sector": data.get("sector"),
             "status": "active",
 
-            # ---- Sites déclarés (ancrage carte organisationnelle, chapitre 2 §2.1.4) ----
-            # chaque élément : { id, name, city, lat, lon }
-            "sites": [
-                Organization.build_site(site) for site in data.get("sites", [])
-            ],
+            # ---- Localisation : une organisation = un point sur la carte.
+            # Une antenne/succursale se déclare comme une organisation à
+            # part entière (ex: "ANTIC — Antenne Littoral"), pas comme un
+            # sous-objet imbriqué — plus simple à gérer, cohérent avec le
+            # fait que chaque antenne a son propre périmètre déclaré.
+            "geo": {
+                "city": data.get("city"),
+                "lat": data.get("lat"),
+                "lon": data.get("lon"),
+            },
 
             # ---- Périmètre déclaré (déclaration collaborative, chapitre 2 §2.1.2) ----
             "declaredPerimeter": {
@@ -35,14 +36,4 @@ class Organization:
             "deletedAt": None,
             "createdAt": now,
             "updatedAt": now,
-        }
-
-    @staticmethod
-    def build_site(data):
-        return {
-            "id": str(ObjectId()),
-            "name": data["name"],
-            "city": data.get("city"),
-            "lat": data.get("lat"),
-            "lon": data.get("lon"),
         }

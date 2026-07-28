@@ -8,6 +8,8 @@ from app.models.organization import (
     Organization
 )
 
+from app.models.db import get_db
+
 from app.repositories.organization import (
     OrganizationRepository
 )
@@ -197,3 +199,32 @@ class OrganizationService:
                     datetime.utcnow()
             },
         )
+
+    @staticmethod
+    def get_map_points():
+        db = get_db()
+
+        filters = {
+            "isDeleted": False,
+            "geo.lat": {"$ne": None},
+            "geo.lon": {"$ne": None},
+        }
+
+        if g.user["role"] != "super_admin":
+            filters["_id"] = ObjectId(g.user["organizationId"])
+
+        organizations = list(OrganizationRepository.collection.find(filters))
+
+        # Compte d'actifs rattachés à chaque organisation, en une seule
+        # requête d'agrégation plutôt qu'une boucle avec N requêtes.
+        org_ids = [str(org["_id"]) for org in organizations]
+        counts = db.assets.aggregate([
+            {"$match": {"organizationId": {"$in": org_ids}, "isDeleted": False}},
+            {"$group": {"_id": "$organizationId", "count": {"$sum": 1}}},
+        ])
+        count_by_org = {c["_id"]: c["count"] for c in counts}
+
+        for org in organizations:
+            org["assetCount"] = count_by_org.get(str(org["_id"]), 0)
+
+        return organizations

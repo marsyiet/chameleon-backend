@@ -1,26 +1,15 @@
 from datetime import datetime
+import ipaddress
 
 
 class Asset:
     """
-    Un Asset = un point sur une carte, identifiable par une icône déterminée par
-    assetType. Chaque type peuple un sous-bloc de détail qui lui est propre
-    (http pour un site web, networkDevice pour un routeur, api pour une API) —
-    les blocs non pertinents pour un actif donné restent simplement vides.
+    Un Asset = un point sur une carte, identifiable par une icône déterminée
+    par natureType. Chaque service détecté porte sa propre nature, son propre
+    http/tls — un même actif peut avoir plusieurs natures (ex: VPN sur 500/udp
+    et web générique sur 80/tcp) ; natureType au niveau de l'actif reflète la
+    nature dominante (cf. nature_detection.derive_asset_nature).
     """
-
-    # Ordre de priorité pour dériver assetType quand plusieurs services coexistent
-    # sur le même actif (ex: HTTP + MySQL sur la même IP -> database l'emporte).
-    TYPE_PRIORITY = (
-        "authentication",
-        "database",
-        "remote-access",
-        "mail",
-        "network",
-        "api",
-        "web",
-        "unknown",
-    )
 
     @staticmethod
     def build(data):
@@ -36,6 +25,7 @@ class Asset:
             "hostname": data.get("hostname"),
             "rootDomain": data.get("rootDomain"),
             "rdns": data.get("rdns"),
+            "cidrBlock": data.get("cidrBlock"),
             "os": data.get("os"),
 
             # ---- Attribution ESTIMÉE (carte nationale, avant confirmation) ----
@@ -43,75 +33,68 @@ class Asset:
                 "guessedOrganizationName": None,
                 # certaine | probable | inconnue
                 "confidence": "inconnue",
-                # signaux ayant permis la déduction : rdns | certificate_cn | whois_org
+                # signaux ayant permis la déduction : rdns | certificate_cn | whois_org | declared
                 "signals": [],
             },
 
-            # ---- Taxonomie de classification (chapitre 2, tableau 2.1) ----
             "exposure": Asset._derive_exposure(data.get("ipAddress")),
-            # database | web | api | remote-access | mail | network | authentication | unknown
-            "assetType": data.get("assetType", "unknown"),
+
+            # ---- Nature de l'actif (remplace l'ancien assetType) ----
+            # vpn_gateway | firewall_router | database | remote_access | mail_server |
+            # dns_server | file_transfer | industrial_control | authentication_portal |
+            # api | web_application | network_device_generic | unknown
+            "natureType": data.get("natureType", "unknown"),
+            "natureConfidence": data.get("natureConfidence", "faible"),
+            "natureSignals": data.get("natureSignals", []),
+            "vendorGuess": data.get("vendorGuess"),
+
             "humanVector": {"exposed": False, "matchedAt": None, "source": None},
             "severity": "informational",
             "detectionConfidence": "probable",
 
-            "geo": {"country": None, "city": None, "lat": None, "lon": None},
+            "geo": {
+                "country": None, "city": None, "lat": None, "lon": None,
+                "accuracyRadiusKm": None, "precise": None,
+            },
             "asn": {"asn": None, "org": None, "isp": None},
+            "bgp": {"prefix": None, "announcedBy": None},
             "tags": data.get("tags", []),
 
-            # ---- Détail spécifique : SITE WEB ----
-            # Peuplé si assetType in (web, api, authentication, mail-webmail).
-            "http": {
-                "title": None,
-                "statusCode": None,
-                "technologies": [],        # ex: ["WordPress 6.4", "PHP 8.1", "nginx"]
-                "faviconUrl": None,
-                "faviconHash": None,
-                "screenshotUrl": None,     # capture prise par l'agent de crawl léger
-                "redirectChain": [],
-                # chaque élément : { url, type: basic|form|sso, confidence }
-                "loginPoints": [],
-                # formulaires "contactez-nous" détectés lors du crawl — signal d'exposition
-                # d'adresses/infos, pas de contenu soumis collecté
-                "contactForms": [],        # ex: [{ "url": "...", "fieldsDetected": ["email","phone"] }]
+            # DNS — peuplé uniquement si target de type "domain"
+            "dns": {
+                "a": [], "aaaa": [], "mx": [], "ns": [], "txt": [],
+                "spfValid": None, "dmarcPresent": None,
+                "zoneTransferVulnerable": None,
+            },
+            "subdomainsDiscovered": [],
+
+            # WHOIS — ipNetwork toujours tenté, domain uniquement si applicable
+            "whois": {
+                "ipNetwork": {"name": None, "country": None, "abuseEmail": None},
+                "domain": None,
             },
 
-            "tls": {
-                "issuer": None,
-                "subject": None,
-                "san": [],
-                "validFrom": None,
-                "validTo": None,
-                "expired": None,
-                "signatureAlgorithm": None,
-                "selfSigned": None,
+            "threatIntel": {
+                "mispMatch": False, "mispEventId": None,
+                "reputationFlags": [],
+                "typosquatCandidateOf": None,
             },
 
-            # ---- Détail spécifique : ÉQUIPEMENT RÉSEAU (routeur, etc.) ----
-            # Peuplé si assetType == "network".
-            "networkDevice": {
-                "vendor": None,             # ex: "MikroTik", "Cisco", "pfSense"
-                "sysDescr": None,           # description SNMP si communauté faible/accessible
-                "adminInterfaceDetected": None,  # url ou null
-                "snmpExposed": None,
+            "correlationKeys": {
+                "certFingerprints": [],
+                "faviconHashes": [],
+                "sharedRdnsRoot": None,
             },
 
-            # ---- Détail spécifique : API ----
-            # Peuplé si assetType == "api".
-            "api": {
-                "specFound": None,         # url d'une spec OpenAPI/Swagger trouvée, si publique
-                "authType": None,          # none | apikey | basic | oauth | unknown
-                "endpointsDiscovered": [],
-            },
-
-            "detectedCapabilities": [],
-
+            # Chaque service porte désormais son propre http/tls/nature —
+            # voir Asset.build_service.
             "services": [],
 
             "riskScore": {
                 "value": 0,
                 "cvssMax": None,
                 "epssMax": None,
+                "kevBonus": 0,
                 "criticality": None,
                 "humanVectorFactor": 0,
                 "calculatedAt": None,
@@ -130,7 +113,6 @@ class Asset:
     def _derive_exposure(ip_address):
         if not ip_address:
             return "unknown"
-        import ipaddress
         try:
             return (
                 "interne"
@@ -141,42 +123,13 @@ class Asset:
             return "unknown"
 
     @staticmethod
-    def derive_asset_type(services):
-        """
-        Applique TYPE_PRIORITY sur les services détectés pour déterminer
-        assetType. `services` : liste de noms de service normalisés
-        (ex: ["http", "mysql"]).
-        """
-        service_to_type = {
-            "vpn": "authentication",
-            "sso": "authentication",
-            "mysql": "database",
-            "postgresql": "database",
-            "mongodb": "database",
-            "redis": "database",
-            "elasticsearch": "database",
-            "ssh": "remote-access",
-            "rdp": "remote-access",
-            "vnc": "remote-access",
-            "telnet": "remote-access",
-            "smtp": "mail",
-            "imap": "mail",
-            "pop3": "mail",
-            "snmp": "network",
-            "api": "api",
-            "http": "web",
-            "https": "web",
-        }
-        found_types = {
-            service_to_type.get(s.lower()) for s in services if service_to_type.get(s.lower())
-        }
-        for t in Asset.TYPE_PRIORITY:
-            if t in found_types:
-                return t
-        return "unknown"
-
-    @staticmethod
     def build_service(data):
+        """
+        `http`/`tls`/`snmp` sont désormais imbriqués ici (par service),
+        plus au niveau racine de l'actif — corrige le cas où un actif avec
+        HTTP sur plusieurs ports voyait un service écraser les données de
+        l'autre.
+        """
         return {
             "port": data["port"],
             "protocol": data["protocol"],
@@ -186,4 +139,14 @@ class Asset:
             "version": data.get("version"),
             "banner": data.get("banner"),
             "cves": data.get("cves", []),
+            "productConfirmed": data.get("productConfirmed", False),
+
+            "natureType": data.get("natureType", "unknown"),
+            "vendorGuess": data.get("vendorGuess"),
+            "natureConfidence": data.get("natureConfidence", "faible"),
+            "natureSignals": data.get("natureSignals", []),
+
+            "http": data.get("http"),
+            "tls": data.get("tls"),
+            "snmp": data.get("snmp"),
         }
