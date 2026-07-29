@@ -1,21 +1,23 @@
 """
-Détection de la nature d'un actif à partir de signaux croisés (favicon,
-titre HTTP, bannières, OS, SNMP) — remplace la classification par simple
-nom de service Nmap, qui ne distingue pas un routeur d'un site web dès
-que tous deux exposent du HTTP.
+Détection multi-rôles : un actif porte tous les rôles que ses services
+justifient, chacun avec sa preuve — remplace l'ancienne classification
+exclusive qui masquait des rôles réels (ex: un routeur exposant aussi du
+SSH n'était classé que "remote_access", jamais "firewall_router" en plus).
+
+L'identité (vendeur/modèle/firmware) est résolue une seule fois pour
+l'actif entier, à partir du meilleur signal trouvé sur N'IMPORTE LEQUEL de
+ses services, puis partagée — corrige le cas où un signal fort sur un port
+(ex: SNMP) restait sans effet sur les autres services du même hôte.
 """
 
-# Table de favicons connus (hash mmh3, convention Shodan/Censys).
-# À enrichir au fil des découvertes — ce n'est volontairement pas exhaustif.
 KNOWN_FAVICON_HASHES = {
-    -1653412201: {"vendor": "MikroTik", "nature": "firewall_router"},
-    116323821: {"vendor": "Fortinet", "nature": "vpn_gateway"},
-    -1220785474: {"vendor": "pfSense", "nature": "firewall_router"},
-    -395468399: {"vendor": "Cisco", "nature": "vpn_gateway"},
-    1768726119: {"vendor": "UniFi", "nature": "network_device_generic"},
+    -1653412201: {"vendor": "MikroTik", "role": "firewall_router"},
+    116323821: {"vendor": "Fortinet", "role": "vpn_gateway"},
+    -1220785474: {"vendor": "pfSense", "role": "firewall_router"},
+    -395468399: {"vendor": "Cisco", "role": "vpn_gateway"},
+    1768726119: {"vendor": "UniFi", "role": "network_device_generic"},
 }
 
-# Mots-clés dans le titre HTTP ou le corps de page, insensibles à la casse.
 HTTP_TITLE_SIGNATURES = [
     (["routeros", "mikrotik"], "MikroTik", "firewall_router"),
     (["+cscoe+", "cisco adaptive security"], "Cisco", "vpn_gateway"),
@@ -24,23 +26,27 @@ HTTP_TITLE_SIGNATURES = [
     (["opnsense"], "OPNsense", "firewall_router"),
     (["unifi network"], "Ubiquiti", "network_device_generic"),
     (["synology"], "Synology", "network_device_generic"),
+    (["grafana"], "Grafana Labs", "devops_tool"),
+    (["jenkins"], "Jenkins", "devops_tool"),
 ]
 
-# Ports dont l'ouverture seule est un signal fort et suffisant.
-PORT_NATURE_MAP = {
+PORT_ROLE_MAP = {
     3306: "database", 5432: "database", 27017: "database",
     6379: "database", 9200: "database", 1433: "database",
-    22: "remote_access", 3389: "remote_access", 5900: "remote_access",
-    23: "remote_access",
-    25: "mail_server", 110: "mail_server", 143: "mail_server",
-    993: "mail_server", 995: "mail_server",
+    22: "remote_access", 3389: "remote_access", 5900: "remote_access", 23: "remote_access",
+    25: "mail_server", 110: "mail_server", 143: "mail_server", 993: "mail_server", 995: "mail_server",
     21: "file_transfer",
     53: "dns_server",
     500: "vpn_gateway", 4500: "vpn_gateway",
     502: "industrial_control", 102: "industrial_control", 47808: "industrial_control",
+    8291: "firewall_router",  # Winbox — propriétaire MikroTik, présence = signal certain
 }
 
-SERVICE_NAME_NATURE_MAP = {
+VENDOR_BY_PORT = {
+    8291: "MikroTik",
+}
+
+SERVICE_NAME_ROLE_MAP = {
     "ssh": "remote_access", "rdp": "remote_access", "vnc": "remote_access", "telnet": "remote_access",
     "mysql": "database", "postgresql": "database", "mongodb": "database", "redis": "database",
     "elasticsearch": "database", "ms-sql-s": "database",
@@ -50,127 +56,209 @@ SERVICE_NAME_NATURE_MAP = {
     "isakmp": "vpn_gateway",
 }
 
-
-def _match_favicon(favicon_hash):
-    if favicon_hash is None:
-        return None
-    entry = KNOWN_FAVICON_HASHES.get(favicon_hash)
-    if entry:
-        return entry["nature"], entry["vendor"], f"favicon_hash:{favicon_hash}"
-    return None
+ROLE_PRIORITY = [
+    "vpn_gateway", "firewall_router", "industrial_control", "database",
+    "remote_access", "mail_server", "dns_server", "file_transfer",
+    "authentication_portal", "api", "devops_tool", "iot_device",
+    "network_device_generic", "web_application", "unknown",
+]
 
 
-def _match_http_title(http_title, http_body_excerpt=""):
-    haystack = f"{http_title or ''} {http_body_excerpt or ''}".lower()
-    for keywords, vendor, nature in HTTP_TITLE_SIGNATURES:
-        for kw in keywords:
-            if kw in haystack:
-                return nature, vendor, f"http_title:{kw}"
-    return None
-
-
-def _match_port_or_service(port, service_name):
-    if port in PORT_NATURE_MAP:
-        return PORT_NATURE_MAP[port], f"port:{port}"
-    if service_name and service_name.lower() in SERVICE_NAME_NATURE_MAP:
-        return SERVICE_NAME_NATURE_MAP[service_name.lower()], f"service:{service_name}"
-    return None, None
-
-
-def _has_login_form(http_data):
-    return bool((http_data or {}).get("loginPoints"))
-
-
-def _has_http(services):
-    return any(s.get("service") in ("http", "https") or s.get("port") in (80, 443, 8080, 8443) for s in services)
-
-
-def derive_service_nature(port, service_name, http_data=None, snmp_data=None):
+def derive_service_roles(svc: dict, service_name: str, port: int) -> list:
     """
-    Détermine la nature d'un service individuel (un port), avec ses propres
-    signaux — un actif peut avoir plusieurs services de natures différentes
-    (ex: 80/http = authentication_portal, 502/modbus = industrial_control).
+    Retourne TOUS les rôles justifiés pour un service donné, pas un seul —
+    chaque rôle porte sa propre confiance et sa propre preuve littérale.
     """
-    signals = []
+    roles = []
 
+    http_data = svc.get("http")
     if http_data:
-        favicon_match = _match_favicon(http_data.get("faviconHash"))
-        if favicon_match:
-            nature, vendor, sig = favicon_match
-            return {
-                "natureType": nature, "vendorGuess": vendor,
-                "natureConfidence": "certaine", "natureSignals": [sig],
-            }
+        favicon_entry = KNOWN_FAVICON_HASHES.get(http_data.get("faviconHash"))
+        if favicon_entry:
+            roles.append({
+                "role": favicon_entry["role"], "confidence": "certaine",
+                "evidence": [f"favicon connu correspondant à {favicon_entry['vendor']}"],
+            })
 
-        title_match = _match_http_title(http_data.get("title"))
-        if title_match:
-            nature, vendor, sig = title_match
-            return {
-                "natureType": nature, "vendorGuess": vendor,
-                "natureConfidence": "probable", "natureSignals": [sig],
-            }
+        title = (http_data.get("title") or "").lower()
+        body = (http_data.get("bodyPreview") or "").lower()
+        for keywords, vendor, role in HTTP_TITLE_SIGNATURES:
+            if any(kw in title or kw in body for kw in keywords):
+                roles.append({
+                    "role": role, "confidence": "probable",
+                    "evidence": [f"titre/contenu de page correspond à la signature '{vendor}'"],
+                })
+                break
 
-        if _has_login_form(http_data):
-            return {
-                "natureType": "authentication_portal", "vendorGuess": None,
-                "natureConfidence": "probable", "natureSignals": ["login_form_detected"],
-            }
+        login_forms = http_data.get("loginPoints") or http_data.get("loginFormsDetected") or []
+        real_forms = [lp for lp in login_forms if lp.get("confidence") == "certaine"]
+        if real_forms:
+            literal_terms = []
+            for lp in real_forms:
+                literal_terms.extend(lp.get("literalTextFound", []))
+            roles.append({
+                "role": "authentication_portal", "confidence": "certaine",
+                "evidence": [f"formulaire de connexion réel détecté" + (f" (champs visibles : {', '.join(literal_terms)})" if literal_terms else "")],
+            })
+        elif login_forms:
+            roles.append({
+                "role": "authentication_portal", "confidence": "probable",
+                "evidence": ["page de vérification d'accès probable (mots-clés admin/vérification détectés)"],
+            })
 
-    if snmp_data and snmp_data.get("vendor"):
-        return {
-            "natureType": "network_device_generic", "vendorGuess": snmp_data["vendor"],
-            "natureConfidence": "probable", "natureSignals": ["snmp_sysdescr"],
-        }
+        if http_data.get("isApi") or http_data.get("apiSignalsFound"):
+            roles.append({
+                "role": "api", "confidence": "certaine",
+                "evidence": ["réponse structurée (JSON) ou endpoint API confirmé"],
+            })
 
-    nature, sig = _match_port_or_service(port, service_name)
-    if nature:
-        signals.append(sig)
-        return {
-            "natureType": nature, "vendorGuess": None,
-            "natureConfidence": "probable", "natureSignals": signals,
-        }
+        if http_data.get("statusCode") and not any(r["role"] in ("firewall_router", "vpn_gateway", "authentication_portal", "api", "devops_tool") for r in roles):
+            roles.append({
+                "role": "web_application", "confidence": "probable",
+                "evidence": [f"réponse HTTP confirmée (statut {http_data.get('statusCode')})"],
+            })
 
-    if service_name in ("http", "https"):
-        return {
-            "natureType": "web_application", "vendorGuess": None,
-            "natureConfidence": "probable", "natureSignals": [f"service:{service_name}"],
-        }
+    devops = svc.get("devopsTool")
+    if devops and devops.get("toolType"):
+        roles.append({
+            "role": "devops_tool", "confidence": "certaine" if devops.get("authRequired") is False else "probable",
+            "evidence": [f"outil DevOps identifié : {devops['toolType']}"],
+        })
 
-    return {
-        "natureType": "unknown", "vendorGuess": None,
-        "natureConfidence": "faible", "natureSignals": [],
+    snmp = svc.get("snmp")
+    if snmp and snmp.get("sysDescr"):
+        roles.append({
+            "role": "network_device_generic", "confidence": "certaine",
+            "evidence": [f"SNMP sysDescr : {snmp['sysDescr']}"],
+        })
+
+    iot = svc.get("iot")
+    if iot and iot.get("protocol"):
+        roles.append({
+            "role": "iot_device", "confidence": "certaine",
+            "evidence": [f"protocole IoT détecté : {iot['protocol']}"],
+        })
+
+    ics = svc.get("ics")
+    if ics and ics.get("protocol"):
+        roles.append({
+            "role": "industrial_control", "confidence": "certaine",
+            "evidence": [f"protocole industriel détecté : {ics['protocol']}"],
+        })
+
+    if not roles:
+        mapped_role = PORT_ROLE_MAP.get(port)
+        if mapped_role:
+            roles.append({
+                "role": mapped_role, "confidence": "certaine" if port == 8291 else "probable",
+                "evidence": [f"port {port} associé de façon fiable à '{mapped_role}'"],
+            })
+        elif service_name in SERVICE_NAME_ROLE_MAP:
+            roles.append({
+                "role": SERVICE_NAME_ROLE_MAP[service_name], "confidence": "probable",
+                "evidence": [f"service Nmap identifié : {service_name}"],
+            })
+
+    if not roles:
+        roles.append({"role": "unknown", "confidence": "faible", "evidence": []})
+
+    return roles
+
+
+def resolve_asset_identity(services: list) -> dict:
+    """
+    Parcourt tous les services d'un hôte et choisit la meilleure identité
+    disponible, peu importe le service qui l'a révélée — c'est ce qui
+    corrige le cas où un signal SNMP/SSH fort restait ignoré pour les
+    autres services du même hôte.
+    """
+    identity = {
+        "vendor": None, "vendorConfidence": "faible",
+        "model": None, "firmwareVersion": None, "deviceLabel": None,
+        "macAddress": None, "macVendor": None,
+        "resolvedFrom": [],
     }
 
+    confidence_rank = {"certaine": 2, "probable": 1, "faible": 0}
 
-def derive_asset_nature(services_with_nature: list) -> dict:
+    for svc in services:
+        port = svc.get("port")
+
+        snmp = svc.get("snmp")
+        if snmp and snmp.get("sysDescr"):
+            if confidence_rank["certaine"] > confidence_rank[identity["vendorConfidence"]]:
+                identity["vendorConfidence"] = "certaine"
+            if not identity["model"] and snmp.get("sysDescr"):
+                identity["model"] = snmp["sysDescr"]
+            if not identity["deviceLabel"] and snmp.get("sysName"):
+                identity["deviceLabel"] = snmp["sysName"]
+            if snmp.get("enterpriseName"):
+                identity["vendor"] = identity["vendor"] or snmp["enterpriseName"]
+                identity["resolvedFrom"].append({"source": "snmp.sysDescr", "value": snmp["sysDescr"]})
+
+        banner_parsed = svc.get("bannerParsed") or {}
+        if banner_parsed.get("vendor"):
+            if not identity["vendor"] or confidence_rank["certaine"] > confidence_rank[identity["vendorConfidence"]]:
+                identity["vendor"] = identity["vendor"] or banner_parsed["vendor"]
+                identity["vendorConfidence"] = "certaine"
+            if banner_parsed.get("version") and not identity["firmwareVersion"]:
+                identity["firmwareVersion"] = banner_parsed["version"]
+            if banner_parsed.get("location") and not identity["deviceLabel"]:
+                identity["deviceLabel"] = banner_parsed["location"]
+            identity["resolvedFrom"].append({
+                "source": f"services[port={port}].banner", "value": svc.get("banner", ""),
+            })
+
+        if port in VENDOR_BY_PORT:
+            identity["vendor"] = identity["vendor"] or VENDOR_BY_PORT[port]
+            identity["resolvedFrom"].append({
+                "source": f"services[port={port}].presence", "value": f"port {port} ouvert (propriétaire)",
+            })
+
+        http = svc.get("http")
+        if http and http.get("title"):
+            title_lower = http["title"].lower()
+            for keywords, vendor, _role in HTTP_TITLE_SIGNATURES:
+                if any(kw in title_lower for kw in keywords):
+                    identity["vendor"] = identity["vendor"] or vendor
+                    identity["resolvedFrom"].append({
+                        "source": f"services[port={port}].http.title", "value": http["title"],
+                    })
+                    break
+
+    return identity
+
+
+def derive_asset_roles(all_service_roles: list) -> tuple:
     """
-    Nature "dominante" de l'actif entier, à partir des natures individuelles
-    de chaque service. Priorité aux natures les plus spécifiques/critiques
-    (VPN/firewall/database avant web_application générique).
+    Fusionne les rôles de tous les services en une liste unique dédupliquée
+    au niveau de l'actif, plus un rôle "principal" pour l'affichage simple
+    (icône/carte), choisi par priorité de criticité.
     """
-    if not services_with_nature:
-        return {
-            "natureType": "unknown", "vendorGuess": None,
-            "natureConfidence": "faible", "natureSignals": [],
-        }
+    merged = {}
+    for role_entry in all_service_roles:
+        role = role_entry["role"]
+        if role == "unknown":
+            continue
+        if role not in merged or confidence_value(role_entry["confidence"]) > confidence_value(merged[role]["confidence"]):
+            merged[role] = role_entry
+        else:
+            merged[role]["evidence"] = list(set(merged[role]["evidence"] + role_entry["evidence"]))
 
-    priority = [
-        "vpn_gateway", "firewall_router", "industrial_control", "database",
-        "remote_access", "mail_server", "dns_server", "file_transfer",
-        "authentication_portal", "api", "network_device_generic",
-        "web_application", "unknown",
-    ]
+    nature_roles = list(merged.values())
 
-    def rank(svc_nature):
+    if not nature_roles:
+        return [{"role": "unknown", "confidence": "faible", "evidence": []}], "unknown"
+
+    def rank(entry):
         try:
-            return priority.index(svc_nature["natureType"])
+            return ROLE_PRIORITY.index(entry["role"])
         except ValueError:
-            return len(priority)
+            return len(ROLE_PRIORITY)
 
-    best = min(services_with_nature, key=rank)
-    return {
-        "natureType": best["natureType"],
-        "vendorGuess": best["vendorGuess"],
-        "natureConfidence": best["natureConfidence"],
-        "natureSignals": best["natureSignals"],
-    }
+    primary = min(nature_roles, key=rank)["role"]
+    return nature_roles, primary
+
+
+def confidence_value(c):
+    return {"certaine": 2, "probable": 1, "faible": 0}.get(c, 0)

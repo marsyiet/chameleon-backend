@@ -5,108 +5,126 @@ import ipaddress
 class Asset:
     """
     Un Asset = un point sur une carte, identifiable par une icône déterminée
-    par natureType. Chaque service détecté porte sa propre nature, son propre
-    http/tls — un même actif peut avoir plusieurs natures (ex: VPN sur 500/udp
-    et web générique sur 80/tcp) ; natureType au niveau de l'actif reflète la
-    nature dominante (cf. nature_detection.derive_asset_nature).
+    par primaryRoleForDisplay. Chaque service détecté porte sa propre nature,
+    son propre http/tls — un même actif peut avoir plusieurs rôles (ex: VPN
+    sur 500/udp et web générique sur 80/tcp), reflétés dans natureRoles[]
+    (voir nature_detection.derive_asset_roles pour le remplissage via scan).
     """
 
     @staticmethod
     def build(data):
         now = datetime.utcnow()
+
+        # Rôles déclarés manuellement à la création (hors scan) — construits
+        # au même format que ceux produits par le pipeline de scan, pour que
+        # les deux chemins de création restent interchangeables.
+        declared_roles = data.get("natureRoles", [])
+        nature_roles = [
+            {
+                "role": role,
+                "confidence": "certaine",
+                "evidence": ["déclaration manuelle"],
+            }
+            for role in declared_roles
+        ]
+        primary_role = declared_roles[0] if declared_roles else "unknown"
+
         return {
-            # Propriétaire CONFIRMÉ (scan sur domaine déclaré, ou attribution validée
-            # manuellement) — null pour un actif de carte nationale non encore attribué.
             "organizationId": data.get("organizationId"),
             "scanId": data.get("scanId"),
+            "lastScanId": data.get("scanId"),
             "siteId": data.get("siteId"),
+            "cidrBlock": data.get("cidrBlock"),
 
             "ipAddress": data.get("ipAddress"),
             "hostname": data.get("hostname"),
             "rootDomain": data.get("rootDomain"),
-            "rdns": data.get("rdns"),
-            "cidrBlock": data.get("cidrBlock"),
-            "os": data.get("os"),
+            "rdns": data.get("rdns", ""),
 
-            # ---- Attribution ESTIMÉE (carte nationale, avant confirmation) ----
+            # ---- Identité résolue une seule fois, partagée par tous les services ----
+            "identity": {
+                "vendor": None, "vendorConfidence": "faible",
+                "model": None, "firmwareVersion": None, "deviceLabel": None,
+                "macAddress": None, "macVendor": None,
+                "resolvedFrom": [],
+            },
+
+            # ---- Rôles multiples, non exclusifs ----
+            "natureRoles": nature_roles,
+            "primaryRoleForDisplay": primary_role,
+
+            "exposure": Asset._derive_exposure(data.get("ipAddress")),
+            "status": "active",
+            "os": {"guess": None, "confidence": None, "excludedReason": None},
+            "icmp": {"respondsToPing": None},
+
+            "dns": {
+                "a": [], "aaaa": [], "mx": [], "ns": [], "txt": [], "caa": [],
+                "spfValid": None, "dmarcPresent": None, "dmarcPolicy": None,
+                "zoneTransferVulnerable": None,
+            },
+            "passiveDns": {"historicalIps": []},       # nécessite API tierce — reste vide
+            "relatedDomains": [],                        # nécessite API tierce — reste vide
+            "subdomainsDiscovered": [],
+
+            "whois": {
+                "ipNetwork": {"name": None, "country": None, "abuse": None},
+                "domain": None,
+            },
+
+            # ---- Attribution : estimée par défaut, confirmée via
+            # AssetService.confirm_attribution ----
             "attribution": {
                 "guessedOrganizationName": None,
-                # certaine | probable | inconnue
                 "confidence": "inconnue",
-                # signaux ayant permis la déduction : rdns | certificate_cn | whois_org | declared
                 "signals": [],
             },
 
-            "exposure": Asset._derive_exposure(data.get("ipAddress")),
+            "services": [],
 
-            # ---- Nature de l'actif (remplace l'ancien assetType) ----
-            # vpn_gateway | firewall_router | database | remote_access | mail_server |
-            # dns_server | file_transfer | industrial_control | authentication_portal |
-            # api | web_application | network_device_generic | unknown
-            "natureType": data.get("natureType", "unknown"),
-            "natureConfidence": data.get("natureConfidence", "faible"),
-            "natureSignals": data.get("natureSignals", []),
-            "vendorGuess": data.get("vendorGuess"),
+            "authenticationSurfaces": [],
 
-            "humanVector": {"exposed": False, "matchedAt": None, "source": None},
-            "severity": "informational",
-            "detectionConfidence": "probable",
+            "cloudExposure": {
+                "bucketsFound": [],
+                "subdomainTakeoverRisk": [],
+            },
+            "hostingContext": {
+                "sharedHostingNeighbors": [],
+                "cdnProvider": None,
+                "wafProvider": None,
+            },
+
+            "threatIntel": {
+                "mispMatch": False, "mispEventId": None,
+                "reputationFlags": [], "typosquatCandidateOf": None,
+                "breachExposure": {"emailsFoundInBreaches": []},  # nécessite API tierce — reste vide
+            },
+            "codeExposure": {"leakedRepositoriesFound": []},      # nécessite API tierce — reste vide
+
+            "correlationKeys": {
+                "certFingerprints": [], "faviconHashes": [], "sharedRdnsRoot": None,
+            },
 
             "geo": {
                 "country": None, "city": None, "lat": None, "lon": None,
                 "accuracyRadiusKm": None, "precise": None,
             },
             "asn": {"asn": None, "org": None, "isp": None},
-            "bgp": {"prefix": None, "announcedBy": None},
-            "tags": data.get("tags", []),
+            "bgp": {"prefix": None, "asn_name": None, "asn_country": None},
 
-            # DNS — peuplé uniquement si target de type "domain"
-            "dns": {
-                "a": [], "aaaa": [], "mx": [], "ns": [], "txt": [],
-                "spfValid": None, "dmarcPresent": None,
-                "zoneTransferVulnerable": None,
-            },
-            "subdomainsDiscovered": [],
-
-            # WHOIS — ipNetwork toujours tenté, domain uniquement si applicable
-            "whois": {
-                "ipNetwork": {"name": None, "country": None, "abuseEmail": None},
-                "domain": None,
-            },
-
-            "threatIntel": {
-                "mispMatch": False, "mispEventId": None,
-                "reputationFlags": [],
-                "typosquatCandidateOf": None,
-            },
-
-            "correlationKeys": {
-                "certFingerprints": [],
-                "faviconHashes": [],
-                "sharedRdnsRoot": None,
-            },
-
-            # Chaque service porte désormais son propre http/tls/nature —
-            # voir Asset.build_service.
-            "services": [],
+            "humanVector": {"exposed": False, "matchedAt": None, "source": None},
 
             "riskScore": {
-                "value": 0,
-                "cvssMax": None,
-                "epssMax": None,
-                "kevBonus": 0,
-                "criticality": None,
-                "humanVectorFactor": 0,
-                "calculatedAt": None,
+                "value": 0, "cvssMax": None, "epssMax": None, "kevBonus": 0,
+                "criticality": None, "humanVectorFactor": 0,
+                "reasoning": None, "calculatedAt": None,
             },
 
-            "status": "active",
-            "firstSeenAt": now,
-            "lastSeenAt": now,
-            "isDeleted": False,
-            "deletedAt": None,
-            "createdAt": now,
-            "updatedAt": now,
+            "tags": data.get("tags", []),
+            "severity": "informational",
+            "firstSeenAt": now, "lastSeenAt": now,
+            "createdAt": now, "updatedAt": now,
+            "isDeleted": False, "deletedAt": None,
         }
 
     @staticmethod
@@ -114,21 +132,17 @@ class Asset:
         if not ip_address:
             return "unknown"
         try:
-            return (
-                "interne"
-                if ipaddress.ip_address(ip_address).is_private
-                else "externe"
-            )
+            return "interne" if ipaddress.ip_address(ip_address).is_private else "externe"
         except ValueError:
             return "unknown"
 
     @staticmethod
     def build_service(data):
         """
-        `http`/`tls`/`snmp` sont désormais imbriqués ici (par service),
-        plus au niveau racine de l'actif — corrige le cas où un actif avec
-        HTTP sur plusieurs ports voyait un service écraser les données de
-        l'autre.
+        `http`/`tls`/`snmp`/`ftp`/`mail`/`dnsService`/`iot`/`ics`/`devopsTool`
+        sont imbriqués ici (par service), plus au niveau racine de l'actif —
+        évite qu'un actif avec plusieurs services HTTP voie un service
+        écraser les données d'un autre.
         """
         return {
             "port": data["port"],
@@ -138,15 +152,20 @@ class Asset:
             "product": data.get("product"),
             "version": data.get("version"),
             "banner": data.get("banner"),
+            "bannerParsed": data.get("bannerParsed") or {
+                "vendor": None, "location": None, "version": None, "signature": None,
+            },
             "cves": data.get("cves", []),
             "productConfirmed": data.get("productConfirmed", False),
-
-            "natureType": data.get("natureType", "unknown"),
-            "vendorGuess": data.get("vendorGuess"),
-            "natureConfidence": data.get("natureConfidence", "faible"),
-            "natureSignals": data.get("natureSignals", []),
+            "defaultCredentialsFormPresent": data.get("defaultCredentialsFormPresent"),
 
             "http": data.get("http"),
             "tls": data.get("tls"),
             "snmp": data.get("snmp"),
+            "ftp": data.get("ftp"),
+            "mail": data.get("mail"),
+            "dnsService": data.get("dnsService"),
+            "iot": data.get("iot"),
+            "ics": data.get("ics"),
+            "devopsTool": data.get("devopsTool"),
         }

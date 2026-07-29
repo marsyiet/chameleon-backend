@@ -1,30 +1,36 @@
 import base64
+import hashlib
 import json
 import subprocess
 
 import requests
 
 
-def zgrab_http(target: str, port: int) -> dict:
+def zgrab_http(target: str, port: int, use_https: bool = False) -> dict:
     """
-    `target` : hostname si connu (scan organisationnel), sinon IP (scan CIDR).
-    Piper un hostname à zgrab2 lui fait envoyer le bon Host header
-    automatiquement — c'est ce qui manquait avant (on pipait toujours l'IP,
-    donc sur un hébergeur mutualisé comme Vercel on tombait sur le vhost
-    par défaut, pas le vrai site).
+    `target` : hostname si connu, sinon IP. Le hostname donne le bon Host
+    header / SNI — essentiel sur hébergement mutualisé (Vercel, Google
+    Cloud...), où l'IP nue seule ne suffit pas à obtenir la vraie réponse.
     """
     try:
         cmd = [
             "zgrab2",
             "http",
             "--port", str(port),
-            "--timeout", "10s",
-            "--follow-location",
+            "--connect-timeout", "10s",
+            "--target-timeout", "15s",
+            "--max-redirects", "5",
+            "--redirects-succeed",
+            "--max-size", "512",
         ]
+        if use_https:
+            cmd.append("--use-https")
+
         result = subprocess.run(
-            cmd, input=target, text=True, capture_output=True, timeout=20,
+            cmd, input=target, text=True, capture_output=True, timeout=25,
         )
         if result.returncode != 0:
+            print("[ZGRAB HTTP NONZERO EXIT]", result.returncode, result.stderr[:300])
             return {}
         lines = result.stdout.strip().splitlines()
         if not lines:
@@ -32,15 +38,22 @@ def zgrab_http(target: str, port: int) -> dict:
         data = json.loads(lines[0])
         http_result = data.get("data", {}).get("http", {}).get("result", {})
         response = http_result.get("response", {})
+        body = response.get("body", "") or ""
+
+        content_type = (response.get("headers", {}).get("content_type", [""]))[0]
 
         return {
             "title": http_result.get("title"),
             "statusCode": response.get("status_code"),
             "server": (response.get("headers", {}).get("server", [""]))[0],
+            "poweredBy": (response.get("headers", {}).get("x_powered_by", [""]))[0],
+            "contentType": content_type,
             "headers": response.get("headers", {}),
             "redirectChain": [
                 r.get("url", "") for r in http_result.get("redirect_response_chain", [])
             ],
+            "bodyPreview": body[:3000] if body else None,
+            "bodyHashSha256": hashlib.sha256(body.encode("utf-8", "ignore")).hexdigest() if body else None,
         }
     except Exception as e:
         print("[ZGRAB HTTP ERROR]", e)
@@ -48,22 +61,18 @@ def zgrab_http(target: str, port: int) -> dict:
 
 
 def zgrab_tls(target: str, port: int) -> dict:
-    """
-    Même principe : `target` en hostname donne un SNI correct, donc le bon
-    certificat (essentiel sur un hébergeur mutualisé, chaque vhost a son
-    propre certificat).
-    """
     try:
         cmd = [
             "zgrab2",
             "tls",
             "--port", str(port),
-            "--timeout", "10s",
+            "--connect-timeout", "10s",
         ]
         result = subprocess.run(
             cmd, input=target, text=True, capture_output=True, timeout=20,
         )
         if result.returncode != 0:
+            print("[ZGRAB TLS NONZERO EXIT]", result.returncode, result.stderr[:300])
             return {}
         lines = result.stdout.strip().splitlines()
         if not lines:
@@ -82,6 +91,7 @@ def zgrab_tls(target: str, port: int) -> dict:
         subject = cert.get("subject", {}).get("common_name", [""])
         san = cert.get("extensions", {}).get("subject_alt_name", {}).get("dns_names", [])
         validity = cert.get("validity", {})
+        fingerprint = cert.get("fingerprint_sha256") or data.get("data", {}).get("tls", {}).get("result", {}).get("handshake_log", {}).get("server_certificates", {}).get("certificate", {}).get("raw", {}).get("fingerprint_sha256")
 
         return {
             "issuer": issuer[0] if issuer else None,
@@ -91,6 +101,7 @@ def zgrab_tls(target: str, port: int) -> dict:
             "validTo": validity.get("end"),
             "signatureAlgorithm": cert.get("signature_algorithm", {}).get("name"),
             "selfSigned": cert.get("signature", {}).get("self_signed"),
+            "fingerprintSha256": fingerprint,
         }
     except Exception as e:
         print("[ZGRAB TLS ERROR]", e)
@@ -98,11 +109,6 @@ def zgrab_tls(target: str, port: int) -> dict:
 
 
 def fetch_favicon(target: str, port: int, use_https: bool) -> dict:
-    """
-    `target` en hostname => requests envoie le bon Host header nativement
-    (c'est juste l'URL). C'était le bug : avant, on construisait toujours
-    l'URL avec l'IP brute.
-    """
     scheme = "https" if use_https else "http"
     url = f"{scheme}://{target}:{port}/favicon.ico"
     try:

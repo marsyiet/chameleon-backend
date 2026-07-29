@@ -1,4 +1,7 @@
 import re
+import socket
+import time
+import random
 import subprocess
 
 
@@ -40,6 +43,8 @@ def fingerprint_host(host: str, ports: list) -> dict:
         print("[NMAP ERROR]", result.stderr)
         return {"services": [], "os": None}
 
+    print("[NMAP RAW XML LENGTH]", len(result.stdout))
+
     return _parse_nmap_xml(result.stdout)
 
 
@@ -60,10 +65,8 @@ def _parse_nmap_xml(xml_output: str) -> dict:
             version = svc.service_dict.get("version", "")
             banner  = svc.service_dict.get("extrainfo", "")
 
-            # Nettoyer version OpenSSH for_Windows
             version = version.replace("for_Windows_", "")
 
-            # Fallback version depuis scripts NSE si product vide
             if not product and svc.scripts_results:
                 for script in svc.scripts_results:
                     output = script.get("output", "")
@@ -89,9 +92,6 @@ def _parse_nmap_xml(xml_output: str) -> dict:
                             version = match.group(1)
                         break
 
-                    # mongodb-databases : la sortie liste les bases si l'accès
-                    # est possible SANS authentification — signal de risque
-                    # au moins aussi important que la version elle-même.
                     if "mongod" in output.lower() or "MongoDB" in output:
                         product = "MongoDB"
                         if "ERROR" not in output and "requires authentication" not in output.lower():
@@ -101,7 +101,6 @@ def _parse_nmap_xml(xml_output: str) -> dict:
                             version = match.group(1)
                         break
 
-                    # redis-info renvoie généralement "redis_version:X.X.X"
                     if "redis_version" in output:
                         product = "Redis"
                         match = re.search(r"redis_version:\s*([\d.]+)", output)
@@ -129,25 +128,91 @@ def _parse_nmap_xml(xml_output: str) -> dict:
     return {"services": services, "os": os_info}
 
 
-def scan_domain(scan_id: str, target_id: str, domain: str, site_id: str = None):
-    import socket
-    from app.engine.tasks.masscan_task import _process_host
+def scan_domain(scan_id: str, target_id: str, domain: str, site_id: str = None, organization_id: str = None):
+    """
+    Cartographie organisationnelle par domaine (chapitre 2, §2.1.1) :
+    1. Découverte de sous-domaines (Certificate Transparency)
+    2. Résolution DNS complète (A/AAAA/MX/NS/TXT) + test de transfert de zone
+    3. WHOIS du domaine
+    4. Regroupement des (sous-)domaines par IP résolue
+    5. Pour chaque IP unique : balayage réel des ports (Masscan TCP+UDP),
+       avec filtrage des faux positifs généralisés (pare-feu/proxy qui
+       répond "ouvert" sur presque tous les ports testés).
+    """
+    from app.engine.tasks.masscan_task import (
+        _process_host, _run_masscan, _filter_suspicious_ports,
+        DEFAULT_PORTS, UDP_PORTS,
+    )
+    from app.engine.tasks.enrichment import (
+        discover_subdomains_ct, resolve_dns_records,
+        test_zone_transfer, get_whois_domain,
+    )
 
-    try:
-        ip = socket.gethostbyname(domain)
-    except socket.gaierror:
-        print(f"[DNS ERROR] {domain}")
+    dns_records = resolve_dns_records(domain)
+    subdomains = discover_subdomains_ct(domain)
+    zone_transfer_vulnerable = test_zone_transfer(domain, dns_records.get("ns", []))
+    dns_records["zoneTransferVulnerable"] = zone_transfer_vulnerable
+    whois_domain = get_whois_domain(domain)
+
+    print(f"[SUBDOMAINS] {len(subdomains)} découverts pour {domain}")
+    if zone_transfer_vulnerable:
+        print(f"[ZONE TRANSFER] {domain} : AU MOINS UN nameserver accepte l'AXFR — configuration à risque")
+
+    all_hostnames = [domain] + subdomains
+    ip_to_hostnames = {}
+
+    for hostname in all_hostnames:
+        try:
+            ip = socket.gethostbyname(hostname)
+            ip_to_hostnames.setdefault(ip, []).append(hostname)
+        except socket.gaierror:
+            continue
+
+    if not ip_to_hostnames:
+        print(f"[DNS ERROR] Impossible de résoudre {domain} ni ses sous-domaines")
         return
 
-    common_ports = [
-        21, 22, 23, 25, 80, 110, 143, 161, 443,
-        3000, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017,
-    ]
+    consecutive_failures = 0
+    circuit_breaker_threshold = 3
+    circuit_breaker_cooldown = 30
+    total_tcp_ports = len(DEFAULT_PORTS.split(","))
 
-    # Réutilise exactement le même traitement que scan_cidr (nmap + zgrab http/tls
-    # + favicon + crawler + scoring) au lieu de dupliquer une version incomplète —
-    # c'est ce qui manquait avant (zgrab n'était jamais appelé ici).
-    _process_host(
-        scan_id, ip, common_ports,
-        target_type="domain", domain=domain, site_id=site_id,
-    )
+    for ip, hostnames in ip_to_hostnames.items():
+        time.sleep(random.uniform(0.3, 1.2))
+
+        primary_hostname = hostnames[0]
+        cidr = f"{ip}/32"
+
+        try:
+            tcp_hosts = _run_masscan(cidr, DEFAULT_PORTS, udp=False)
+            udp_hosts = _run_masscan(cidr, UDP_PORTS, udp=True)
+
+            raw_tcp_ports = tcp_hosts.get(ip, [])
+            filtered_tcp_ports = _filter_suspicious_ports(ip, raw_tcp_ports, total_tcp_ports)
+
+            ports = {
+                "tcp": filtered_tcp_ports,
+                "udp": udp_hosts.get(ip, []),
+            }
+
+            if not ports["tcp"] and not ports["udp"]:
+                print(f"[NO OPEN PORT] {ip} ({primary_hostname}) — aucun port ouvert détecté")
+                continue
+
+            _process_host(
+                scan_id, ip, ports,
+                target_type="domain", domain=primary_hostname, site_id=site_id,
+                organization_id=organization_id,
+                dns_data=dns_records if primary_hostname == domain else None,
+                subdomains_discovered=subdomains if primary_hostname == domain else None,
+                whois_domain=whois_domain if primary_hostname == domain else None,
+                all_hostnames_for_ip=hostnames,
+            )
+            consecutive_failures = 0
+        except Exception as e:
+            print(f"[HOST ERROR] {ip} ({primary_hostname}) -> {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= circuit_breaker_threshold:
+                print(f"[CIRCUIT BREAKER] pause de {circuit_breaker_cooldown}s")
+                time.sleep(circuit_breaker_cooldown)
+                consecutive_failures = 0

@@ -6,23 +6,23 @@ from marshmallow import (
     ValidationError,
 )
 
-ASSET_TYPES = [
-    "web",
-    "database",
-    "api",
-    "remote-access",
-    "mail",
-    "authentication",
-    "network",
-    "unknown",
+# Aligné sur ROLE_PRIORITY (nature_detection.py) — un actif créé manuellement
+# peut déclarer un ou plusieurs rôles dès la création, cohérent avec
+# natureRoles[] désormais non exclusif.
+NATURE_ROLES = [
+    "web_application", "api", "database", "remote_access", "mail_server",
+    "dns_server", "file_transfer", "vpn_gateway", "firewall_router",
+    "industrial_control", "authentication_portal", "network_device_generic",
+    "iot_device", "devops_tool", "unknown",
 ]
+
 
 # Payload création (enregistrement manuel d'un actif connu, hors scan)
 #
 # {
 #     "ipAddress": "8.8.8.8",
 #     "hostname": "dns.google.com",
-#     "assetType": "web",
+#     "natureRoles": ["web_application"],
 #     "organizationId": "665f1a2b9c1e4a0012345678",   # optionnel — propriétaire confirmé
 #     "siteId": "665f1a2b9c1e4a0012345699",            # optionnel — rattachement manuel de site
 #     "tags": ["production"]
@@ -36,13 +36,13 @@ class CreateAssetSchema(
     hostname = fields.String(
         allow_none=True
     )
-    # classification de l'actif (web/database/api/...), PAS le type de seed
-    # (renommé pour éviter toute confusion avec l'ancien schéma)
-    assetType = fields.String(
-        load_default="unknown",
-        validate=validate.OneOf(
-            ASSET_TYPES
-        )
+    # Rôles déclarés manuellement à la création — un actif peut en avoir
+    # plusieurs simultanément (ex: routeur ET portail d'authentification).
+    natureRoles = fields.List(
+        fields.String(
+            validate=validate.OneOf(NATURE_ROLES)
+        ),
+        load_default=list
     )
     organizationId = fields.String(
         allow_none=True
@@ -68,7 +68,7 @@ class CreateAssetSchema(
 #
 # {
 #     "status": "inactive",
-#     "assetType": "database",
+#     "natureRoles": ["database"],
 #     "siteId": "665f1a2b9c1e4a0012345699",
 #     "tags": ["production", "critical"]
 # }
@@ -83,10 +83,10 @@ class UpdateAssetSchema(
             ]
         )
     )
-    # correction manuelle de la classification automatique, si besoin
-    assetType = fields.String(
-        validate=validate.OneOf(
-            ASSET_TYPES
+    # Correction manuelle des rôles détectés automatiquement, si besoin.
+    natureRoles = fields.List(
+        fields.String(
+            validate=validate.OneOf(NATURE_ROLES)
         )
     )
     # rattachement manuel de site (IP privée non géolocalisable, chapitre 2 §2.1.4,

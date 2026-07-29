@@ -1,9 +1,10 @@
 """
 Corrélation d'actifs par signaux partagés (certificat, favicon, rDNS,
-bloc ASN) — modélise les relations entre actifs sous forme d'arêtes
-stockées en base, en réponse au besoin de graphe posé au chapitre 2.
-Implémentation sur magasin documentaire (Mongo), pas une base de graphe
-dédiée : compromis retenu pour rester dans le périmètre du stage.
+bloc ASN, domaine parent) — modélise les relations entre actifs sous
+forme d'arêtes stockées en base, en réponse au besoin de graphe posé au
+chapitre 2. Implémentation sur magasin documentaire (Mongo), pas une
+base de graphe dédiée : compromis retenu pour rester dans le périmètre
+du stage.
 """
 
 from datetime import datetime
@@ -23,6 +24,7 @@ def compute_correlations_for_scan(scan_id: str, organization_id: str):
     edges.extend(_correlate_by_favicon(assets))
     edges.extend(_correlate_by_rdns_root(assets))
     edges.extend(_correlate_by_asn_block(assets))
+    edges.extend(_correlate_by_parent_domain(assets))
 
     now = datetime.utcnow()
     for edge in edges:
@@ -123,5 +125,41 @@ def _correlate_by_asn_block(assets):
                 "relationType": "same_asn_block",
                 "evidence": f"asn={asn_a}",
                 "confidence": "probable",
+            })
+    return edges
+
+
+def _parent_domain(hostname):
+    if not hostname:
+        return None
+    parts = hostname.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+
+
+def _correlate_by_parent_domain(assets):
+    """
+    Relie les actifs qui partagent le même domaine racine (ex: admin.,
+    app., www.kirilearn.com -> kirilearn.com) — le lien organisationnel
+    le plus direct pour une cartographie par domaine, indépendant de
+    l'infrastructure d'hébergement (qui peut différer d'un sous-domaine
+    à l'autre sur des architectures cloud modernes : Google Cloud pour
+    l'un, Vercel pour un autre, par exemple).
+    """
+    edges = []
+    for a, b in combinations(assets, 2):
+        hostname_a = a.get("hostname") or ""
+        hostname_b = b.get("hostname") or ""
+        if not hostname_a or not hostname_b:
+            continue
+
+        root_a = _parent_domain(hostname_a)
+        root_b = _parent_domain(hostname_b)
+
+        if root_a and root_a == root_b and hostname_a != hostname_b:
+            edges.append({
+                "fromAssetId": str(a["_id"]), "toAssetId": str(b["_id"]),
+                "relationType": "same_parent_domain",
+                "evidence": f"rootDomain={root_a}",
+                "confidence": "certaine",
             })
     return edges

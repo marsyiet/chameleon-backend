@@ -1,6 +1,10 @@
 import re
 import socket
+import time
 import requests
+import dns.resolver
+import dns.query
+import dns.zone
 from app.config.config import config
 
 # Hébergeurs PaaS/CDN connus dont le nom de produit détecté indique que
@@ -9,6 +13,8 @@ from app.config.config import config
 PAAS_PRODUCTS = ["vercel", "netlify", "heroku", "render", "cloudflare pages"]
 
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+CRT_SH_URL = "https://crt.sh/"
+CERTSPOTTER_URL = "https://api.certspotter.com/v1/issuances"
 
 # Cache en mémoire du process worker — le catalogue KEV compte plusieurs
 # milliers d'entrées et change peu dans la journée ; le retélécharger à
@@ -18,7 +24,6 @@ KEV_CACHE_TTL_SECONDS = 6 * 3600  # 6h
 
 
 def _get_kev_ids() -> set:
-    import time
     now = time.time()
 
     if _kev_cache["ids"] is not None and (now - _kev_cache["fetched_at"]) < KEV_CACHE_TTL_SECONDS:
@@ -33,8 +38,6 @@ def _get_kev_ids() -> set:
         return ids
     except Exception as e:
         print("[CISA KEV ERROR]", e)
-        # En cas d'échec, on retombe sur l'ancien cache s'il existe, plutôt
-        # que de perdre l'information sur tous les actifs du scan en cours.
         return _kev_cache["ids"] or set()
 
 
@@ -72,9 +75,7 @@ def _get_geoip_and_asn(ip: str) -> tuple:
     """
     Un seul appel ipinfo.io fournit à la fois géolocalisation et ASN, avec
     une précision généralement meilleure que GeoLite2 gratuit sur les plages
-    IP africaines (cf. discussion, chapitre 3 : GeoLite2 retombe souvent sur
-    le centroïde national, rayon ~1000km, faute de données ville pour ces
-    plages). MaxMind reste utilisé en secours si ipinfo.io échoue.
+    IP africaines. MaxMind reste utilisé en secours si ipinfo.io échoue.
     """
     geo, asn = {}, {}
     try:
@@ -131,6 +132,190 @@ def _get_rdns(ip: str) -> str:
         return ""
 
 
+def _clean_subdomain_name(name: str) -> str:
+    """
+    Nettoyage défensif : certaines réponses (crt.sh notamment) contiennent
+    parfois un format Markdown [nom](url) ou des espaces parasites au lieu
+    d'un nom de domaine brut.
+    """
+    name = name.strip().lower()
+    match = re.match(r"^\[([^\]]+)\]", name)
+    if match:
+        name = match.group(1)
+    if name.startswith("*."):
+        name = name[2:]
+    return name
+
+
+def _discover_subdomains_crtsh(domain: str, max_retries: int = 3) -> list:
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(
+                CRT_SH_URL,
+                params={"q": f"%.{domain}", "output": "json"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                entries = r.json()
+                subdomains = set()
+                for entry in entries:
+                    name_value = entry.get("name_value", "")
+                    for raw_name in name_value.split("\n"):
+                        name = _clean_subdomain_name(raw_name)
+                        if name.endswith(domain) and name != domain:
+                            subdomains.add(name)
+                return sorted(subdomains)
+
+            print(f"[CT LOGS crt.sh] status={r.status_code} pour {domain} (tentative {attempt+1}/{max_retries})")
+        except Exception as e:
+            print(f"[CT LOGS crt.sh ERROR] {type(e).__name__} {e} (tentative {attempt+1}/{max_retries})")
+
+        if attempt < max_retries - 1:
+            time.sleep(3 * (attempt + 1))
+
+    return []
+
+
+def _discover_subdomains_certspotter(domain: str) -> list:
+    """
+    Source de repli si crt.sh échoue — certspotter (Sectigo) expose une API
+    Certificate Transparency équivalente, sans clé pour un usage raisonnable.
+    """
+    try:
+        r = requests.get(
+            CERTSPOTTER_URL,
+            params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"[CT LOGS certspotter] status={r.status_code} pour {domain}")
+            return []
+        entries = r.json()
+        subdomains = set()
+        for entry in entries:
+            for raw_name in entry.get("dns_names", []):
+                name = _clean_subdomain_name(raw_name)
+                if name.endswith(domain) and name != domain:
+                    subdomains.add(name)
+        return sorted(subdomains)
+    except Exception as e:
+        print(f"[CT LOGS certspotter ERROR] {type(e).__name__} {e}")
+        return []
+
+
+def discover_subdomains_ct(domain: str) -> list:
+    """
+    Découverte de sous-domaines par Certificate Transparency (chapitre 1,
+    §reconnaissance). crt.sh est la source primaire ; en cas d'échec après
+    plusieurs tentatives (service public peu fiable, observé en pratique :
+    404/502 intermittents), on retombe sur certspotter comme source de
+    secours plutôt que d'abandonner la découverte.
+    """
+    subdomains = _discover_subdomains_crtsh(domain)
+    if subdomains:
+        print(f"[CT LOGS] {len(subdomains)} sous-domaines trouvés pour {domain} (crt.sh)")
+        return subdomains
+
+    print(f"[CT LOGS] crt.sh indisponible pour {domain}, tentative via certspotter")
+    subdomains = _discover_subdomains_certspotter(domain)
+    print(f"[CT LOGS] {len(subdomains)} sous-domaines trouvés pour {domain} (certspotter)")
+    return subdomains
+
+
+def resolve_dns_records(domain: str) -> dict:
+    """
+    Enregistrements DNS complets — A, AAAA, MX, NS, TXT — et vérification
+    basique SPF/DMARC à partir des TXT (chapitre 1, §DNS).
+    """
+    records = {"a": [], "aaaa": [], "mx": [], "ns": [], "txt": [],
+               "spfValid": None, "dmarcPresent": None}
+
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 5
+
+    try:
+        records["a"] = [str(r) for r in resolver.resolve(domain, "A")]
+    except Exception:
+        pass
+    try:
+        records["aaaa"] = [str(r) for r in resolver.resolve(domain, "AAAA")]
+    except Exception:
+        pass
+    try:
+        records["mx"] = [str(r.exchange) for r in resolver.resolve(domain, "MX")]
+    except Exception:
+        pass
+    try:
+        records["ns"] = [str(r) for r in resolver.resolve(domain, "NS")]
+    except Exception:
+        pass
+    try:
+        txt_records = [str(r) for r in resolver.resolve(domain, "TXT")]
+        records["txt"] = txt_records
+        records["spfValid"] = any("v=spf1" in t for t in txt_records)
+    except Exception:
+        pass
+    try:
+        dmarc_records = [str(r) for r in resolver.resolve(f"_dmarc.{domain}", "TXT")]
+        records["dmarcPresent"] = any("v=DMARC1" in t for t in dmarc_records)
+    except Exception:
+        records["dmarcPresent"] = False
+
+    return records
+
+
+def test_zone_transfer(domain: str, nameservers: list) -> bool:
+    """
+    Tente un transfert de zone AXFR sur chaque nameserver du domaine — une
+    zone transférable expose l'intégralité de la structure DNS interne.
+    Retourne True si AU MOINS un nameserver accepte le transfert.
+    """
+    for ns in nameservers:
+        ns_clean = ns.rstrip(".")
+        try:
+            resolved_ns = dns.resolver.resolve(ns_clean, "A")
+            ns_ip = str(resolved_ns[0])
+            zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=5))
+            if zone:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def get_whois_domain(domain: str) -> dict:
+    """
+    WHOIS du nom de domaine (registrar, dates, nameservers) — distinct du
+    WHOIS de l'IP déjà géré par _get_whois.
+    """
+    try:
+        import whois
+        w = whois.whois(domain)
+        registrar = w.registrar
+        created = w.creation_date
+        expires = w.expiration_date
+        if isinstance(created, list):
+            created = created[0] if created else None
+        if isinstance(expires, list):
+            expires = expires[0] if expires else None
+        nameservers = w.name_servers
+        if isinstance(nameservers, str):
+            nameservers = [nameservers]
+        return {
+            "registrar": registrar,
+            "createdAt": created.isoformat() if created else None,
+            "expiresAt": expires.isoformat() if expires else None,
+            "nameservers": list(nameservers) if nameservers else [],
+        }
+    except ImportError:
+        print("[WHOIS DOMAIN] python-whois non installé — pip install python-whois")
+        return {}
+    except Exception as e:
+        print("[WHOIS DOMAIN ERROR]", e)
+        return {}
+
+
 def _version_tuple(version_str):
     if not version_str:
         return None
@@ -175,9 +360,8 @@ def _cve_matches_version(cve_raw, detected_version):
 def _paas_mitigation_status(description: str, product: str) -> str:
     """
     Si la CVE elle-même documente qu'elle ne s'applique pas sur le PaaS
-    détecté (cas fréquent chez Vercel/Netlify, qui patchent ou neutralisent
-    côté plateforme), on déclasse en "mitigated" plutôt que de la compter
-    comme un risque valide dans le scoring.
+    détecté, on déclasse en "mitigated" plutôt que de la compter comme un
+    risque valide dans le scoring.
     """
     product_lower = (product or "").lower()
     matched_paas = next((p for p in PAAS_PRODUCTS if p in product_lower), None)
