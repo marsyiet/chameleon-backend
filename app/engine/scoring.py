@@ -1,5 +1,5 @@
 """
-Calcul du score de risque composite — désormais basé sur primaryRoleForDisplay
+Calcul du score de risque composite — basé sur primaryRoleForDisplay
 (le rôle le plus critique parmi natureRoles), avec justification textuelle.
 """
 

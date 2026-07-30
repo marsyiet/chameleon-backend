@@ -36,6 +36,7 @@ def parse_banner(banner: str, protocol_hint: str = "") -> dict:
     trouvé, plutôt que d'inventer une valeur approximative.
     """
     result = {"vendor": None, "location": None, "version": None, "signature": None}
+
     if not banner:
         return result
 
@@ -58,8 +59,7 @@ def parse_banner(banner: str, protocol_hint: str = "") -> dict:
         result["version"] = version_match.group(1)
 
     # Localisation : heuristique simple — mot en majuscules de 3+ lettres
-    # qui n'est ni le vendeur ni un mot protocolaire courant. Volontairement
-    # prudent : ne remplit que si un candidat clair se dégage.
+    # qui n'est ni le vendeur ni un mot protocolaire courant.
     protocol_words = {"FTP", "SSH", "SERVER", "READY", "ROUTER", "OS"}
     caps_words = re.findall(r"\b[A-Z]{3,}\b", banner)
     location_candidates = [

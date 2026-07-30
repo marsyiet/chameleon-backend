@@ -52,7 +52,7 @@ def zgrab_http(target: str, port: int, use_https: bool = False) -> dict:
             "redirectChain": [
                 r.get("url", "") for r in http_result.get("redirect_response_chain", [])
             ],
-            "bodyPreview": body[:3000] if body else None,
+            "bodyPreview": body[:8000] if body else None,
             "bodyHashSha256": hashlib.sha256(body.encode("utf-8", "ignore")).hexdigest() if body else None,
         }
     except Exception as e:

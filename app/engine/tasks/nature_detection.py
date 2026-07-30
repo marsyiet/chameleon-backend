@@ -1,13 +1,10 @@
 """
 Détection multi-rôles : un actif porte tous les rôles que ses services
-justifient, chacun avec sa preuve — remplace l'ancienne classification
-exclusive qui masquait des rôles réels (ex: un routeur exposant aussi du
-SSH n'était classé que "remote_access", jamais "firewall_router" en plus).
+justifient, chacun avec sa preuve.
 
 L'identité (vendeur/modèle/firmware) est résolue une seule fois pour
 l'actif entier, à partir du meilleur signal trouvé sur N'IMPORTE LEQUEL de
-ses services, puis partagée — corrige le cas où un signal fort sur un port
-(ex: SNMP) restait sans effet sur les autres services du même hôte.
+ses services, puis partagée.
 """
 
 KNOWN_FAVICON_HASHES = {
@@ -37,13 +34,16 @@ PORT_ROLE_MAP = {
     25: "mail_server", 110: "mail_server", 143: "mail_server", 993: "mail_server", 995: "mail_server",
     21: "file_transfer",
     53: "dns_server",
+    161: "network_device_generic",
     500: "vpn_gateway", 4500: "vpn_gateway",
     502: "industrial_control", 102: "industrial_control", 47808: "industrial_control",
-    8291: "firewall_router",  # Winbox — propriétaire MikroTik, présence = signal certain
+    8291: "firewall_router",
+    8728: "firewall_router",
 }
 
 VENDOR_BY_PORT = {
     8291: "MikroTik",
+    8728: "MikroTik",
 }
 
 SERVICE_NAME_ROLE_MAP = {
@@ -106,6 +106,18 @@ def derive_service_roles(svc: dict, service_name: str, port: int) -> list:
                 "evidence": ["page de vérification d'accès probable (mots-clés admin/vérification détectés)"],
             })
 
+        # Fallback : pages de login connues par signature titre quand
+        # le formulaire HTML n'est pas dans le body (ex: RouterOS)
+        if not any(r["role"] == "authentication_portal" for r in roles):
+            login_title_keywords = ["routeros router configuration", "login", "sign in", "connexion"]
+            if any(kw in title for kw in login_title_keywords):
+                login_body_keywords = ["password", "mot de passe", "login", "#login"]
+                if any(kw in body for kw in login_body_keywords):
+                    roles.append({
+                        "role": "authentication_portal", "confidence": "probable",
+                        "evidence": ["titre et contenu de page suggèrent un portail de connexion"],
+                    })
+
         if http_data.get("isApi") or http_data.get("apiSignalsFound"):
             roles.append({
                 "role": "api", "confidence": "certaine",
@@ -150,7 +162,7 @@ def derive_service_roles(svc: dict, service_name: str, port: int) -> list:
         mapped_role = PORT_ROLE_MAP.get(port)
         if mapped_role:
             roles.append({
-                "role": mapped_role, "confidence": "certaine" if port == 8291 else "probable",
+                "role": mapped_role, "confidence": "certaine" if port in (8291, 8728) else "probable",
                 "evidence": [f"port {port} associé de façon fiable à '{mapped_role}'"],
             })
         elif service_name in SERVICE_NAME_ROLE_MAP:
@@ -166,12 +178,6 @@ def derive_service_roles(svc: dict, service_name: str, port: int) -> list:
 
 
 def resolve_asset_identity(services: list) -> dict:
-    """
-    Parcourt tous les services d'un hôte et choisit la meilleure identité
-    disponible, peu importe le service qui l'a révélée — c'est ce qui
-    corrige le cas où un signal SNMP/SSH fort restait ignoré pour les
-    autres services du même hôte.
-    """
     identity = {
         "vendor": None, "vendorConfidence": "faible",
         "model": None, "firmwareVersion": None, "deviceLabel": None,
@@ -184,6 +190,7 @@ def resolve_asset_identity(services: list) -> dict:
     for svc in services:
         port = svc.get("port")
 
+        # ── SNMP : signal le plus fiable ──
         snmp = svc.get("snmp")
         if snmp and snmp.get("sysDescr"):
             if confidence_rank["certaine"] > confidence_rank[identity["vendorConfidence"]]:
@@ -196,6 +203,7 @@ def resolve_asset_identity(services: list) -> dict:
                 identity["vendor"] = identity["vendor"] or snmp["enterpriseName"]
                 identity["resolvedFrom"].append({"source": "snmp.sysDescr", "value": snmp["sysDescr"]})
 
+        # ── Bannières protocolaires ──
         banner_parsed = svc.get("bannerParsed") or {}
         if banner_parsed.get("vendor"):
             if not identity["vendor"] or confidence_rank["certaine"] > confidence_rank[identity["vendorConfidence"]]:
@@ -209,18 +217,22 @@ def resolve_asset_identity(services: list) -> dict:
                 "source": f"services[port={port}].banner", "value": svc.get("banner", ""),
             })
 
+        # ── Ports propriétaires ──
         if port in VENDOR_BY_PORT:
             identity["vendor"] = identity["vendor"] or VENDOR_BY_PORT[port]
             identity["resolvedFrom"].append({
                 "source": f"services[port={port}].presence", "value": f"port {port} ouvert (propriétaire)",
             })
 
+        # ── Titre HTTP ──
         http = svc.get("http")
         if http and http.get("title"):
             title_lower = http["title"].lower()
             for keywords, vendor, _role in HTTP_TITLE_SIGNATURES:
                 if any(kw in title_lower for kw in keywords):
                     identity["vendor"] = identity["vendor"] or vendor
+                    if confidence_rank.get("probable", 1) > confidence_rank.get(identity["vendorConfidence"], 0):
+                        identity["vendorConfidence"] = "probable"
                     identity["resolvedFrom"].append({
                         "source": f"services[port={port}].http.title", "value": http["title"],
                     })
@@ -230,11 +242,6 @@ def resolve_asset_identity(services: list) -> dict:
 
 
 def derive_asset_roles(all_service_roles: list) -> tuple:
-    """
-    Fusionne les rôles de tous les services en une liste unique dédupliquée
-    au niveau de l'actif, plus un rôle "principal" pour l'affichage simple
-    (icône/carte), choisi par priorité de criticité.
-    """
     merged = {}
     for role_entry in all_service_roles:
         role = role_entry["role"]

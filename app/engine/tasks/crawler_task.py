@@ -1,18 +1,14 @@
 """
-Agent de crawl — découverte de formulaires de login réels, sondage de
-signaux API, extraction de métadonnées, détection de technologies.
+Agent de crawl — découverte de formulaires de login, sondage de signaux
+API, extraction de métadonnées, détection de technologies.
 
 Réutilise le corps de page déjà récupéré par zgrab_http (homepage_body)
-au lieu de refaire une requête séparée — évite un second appel réseau
-redondant qui peut échouer indépendamment du premier (rate limiting,
-timing), ce qui laissait auparavant technologies/loginPoints vides même
-quand zgrab avait pourtant bien récupéré le contenu.
+au lieu de refaire une requête séparée.
 
 Correctif dédup SPA : sur un site à routing catch-all (Next.js, React
 Router...), tester une liste de chemins fixes renvoie souvent la MÊME
 page pour chaque chemin — on ne compte un formulaire "trouvé" que si son
-contenu diffère réellement de ce qui a déjà été vu (page d'accueil ou
-autre chemin), sinon ce n'est pas un nouveau signal.
+contenu diffère réellement de ce qui a déjà été vu.
 """
 
 import hashlib
@@ -49,6 +45,12 @@ API_CONTENT_MARKERS = [
     '"api"', "endpoint", "swagger", "openapi",
 ]
 
+# Frameworks connus pour servir des API (pas des pages web)
+API_FRAMEWORK_SIGNATURES = [
+    "express", "fastapi", "flask", "django rest framework",
+    "koa", "hapi", "spring", "gin", "fiber",
+]
+
 
 def _body_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest()
@@ -68,11 +70,6 @@ def _safe_get(url, return_headers=False):
 
 
 def _normalize_zgrab_headers(zgrab_headers: dict) -> dict:
-    """
-    zgrab retourne des clés snake_case en listes (ex: content_type: [...]),
-    requests retourne du Pascal-Case en chaînes simples — on normalise vers
-    ce dernier format pour réutiliser les mêmes fonctions de détection.
-    """
     if not zgrab_headers:
         return {}
     normalized = {}
@@ -85,11 +82,6 @@ def _normalize_zgrab_headers(zgrab_headers: dict) -> dict:
 def get_site_intelligence(target: str, port: int, use_https: bool,
                            homepage_body: str = None, homepage_status: int = None,
                            homepage_headers: dict = None) -> dict:
-    """
-    `homepage_body`/`homepage_status`/`homepage_headers` : si déjà connus
-    (typiquement récupérés par zgrab_http juste avant), on les réutilise
-    plutôt que de refaire une requête réseau qui peut échouer indépendamment.
-    """
     scheme = "https" if use_https else "http"
     base_url = f"{scheme}://{target}:{port}"
 
@@ -115,6 +107,15 @@ def get_site_intelligence(target: str, port: int, use_https: bool,
         result["technologies"] = _detect_technologies(homepage_html, homepage_headers_final)
         result["pageTitle"] = _extract_title(homepage_html)
         result["metaDescription"] = _extract_meta_description(homepage_html)
+
+        # Détection API par framework serveur (Express, FastAPI, Flask…)
+        # Un framework API sans <title> = probablement pas une page web
+        powered_by = homepage_headers_final.get("X-Powered-By", "").lower()
+        server_header = homepage_headers_final.get("Server", "").lower()
+        if any(fw in powered_by or fw in server_header for fw in API_FRAMEWORK_SIGNATURES):
+            if not _extract_title(homepage_html):
+                result["isApi"] = True
+                result["apiSignalsFound"].append(f"{base_url} (framework: {powered_by or server_header})")
 
         real_forms = _find_login_forms(homepage_html, base_url)
         result["loginPoints"].extend(real_forms)
@@ -189,16 +190,34 @@ def _extract_meta_description(html: str) -> str:
 
 
 def _looks_like_api_response(body: str, content_type: str) -> bool:
+    # 1. Content-Type JSON explicite
     if "application/json" in (content_type or "").lower():
         return True
+
+    # 2. Swagger/OpenAPI en XML
     if "application/xml" in (content_type or "").lower() and "swagger" in (body or "").lower():
         return True
+
     if body:
-        lowered = body.lower().strip()
-        if lowered.startswith("{") or lowered.startswith("["):
+        stripped = body.strip()
+        lowered = stripped.lower()
+
+        # 3. Réponse JSON structurée
+        if stripped.startswith("{") or stripped.startswith("["):
             return True
+
+        # 4. Body très court contenant "API" — typique d'un health check
+        if len(stripped) < 100 and "api" in lowered:
+            return True
+
+        # 5. Body court sans aucune balise HTML — texte brut, pas une page web
+        if len(stripped) < 200 and "<html" not in lowered and "<body" not in lowered and "<!doctype" not in lowered:
+            return True
+
+        # 6. Marqueurs API classiques dans un body court
         if any(marker in lowered for marker in API_CONTENT_MARKERS) and len(body) < 2000:
             return True
+
     return False
 
 
@@ -226,11 +245,25 @@ def _find_login_forms(html: str, page_url: str) -> list:
     points = []
     try:
         soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Formulaires HTML classiques <form> + <input type="password">
         for form in soup.find_all("form"):
             if form.find("input", {"type": "password"}) is not None:
                 points.append({
                     "url": page_url,
                     "type": "form",
+                    "confidence": "certaine",
+                })
+
+        # 2. Logins JS-driven : <input type="password"> sans <form> parent
+        #    (RouterOS WebFig, portails captifs, SPA admin custom…)
+        if not points:
+            all_pw_inputs = soup.find_all("input", {"type": "password"})
+            orphan_pw = [inp for inp in all_pw_inputs if inp.find_parent("form") is None]
+            if orphan_pw:
+                points.append({
+                    "url": page_url,
+                    "type": "js_login",
                     "confidence": "certaine",
                 })
     except Exception:

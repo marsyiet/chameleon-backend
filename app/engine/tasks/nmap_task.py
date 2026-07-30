@@ -21,7 +21,7 @@ def fingerprint_host(host: str, ports: list) -> dict:
         "--open",
         "-T4",
         "-p", port_str,
-        "--host-timeout", "120s",
+        "--host-timeout", "240s",
         "-oX", "-",
         host,
     ]
@@ -33,7 +33,7 @@ def fingerprint_host(host: str, ports: list) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=300,
         )
     except Exception as e:
         print("[NMAP EXEC ERROR]", e)
@@ -129,16 +129,6 @@ def _parse_nmap_xml(xml_output: str) -> dict:
 
 
 def scan_domain(scan_id: str, target_id: str, domain: str, site_id: str = None, organization_id: str = None):
-    """
-    Cartographie organisationnelle par domaine (chapitre 2, §2.1.1) :
-    1. Découverte de sous-domaines (Certificate Transparency)
-    2. Résolution DNS complète (A/AAAA/MX/NS/TXT) + test de transfert de zone
-    3. WHOIS du domaine
-    4. Regroupement des (sous-)domaines par IP résolue
-    5. Pour chaque IP unique : balayage réel des ports (Masscan TCP+UDP),
-       avec filtrage des faux positifs généralisés (pare-feu/proxy qui
-       répond "ouvert" sur presque tous les ports testés).
-    """
     from app.engine.tasks.masscan_task import (
         _process_host, _run_masscan, _filter_suspicious_ports,
         DEFAULT_PORTS, UDP_PORTS,

@@ -9,7 +9,7 @@ from datetime import datetime
 from bson import ObjectId
 
 from app.engine.tasks.nmap_task import fingerprint_host
-from app.engine.tasks.enrichment import enrich_host
+from app.engine.tasks.enrichment import enrich_host, TAGS_MAP
 from app.engine.tasks.zgrab_task import zgrab_http, zgrab_tls, fetch_favicon
 from app.engine.tasks.crawler_task import get_site_intelligence
 from app.engine.tasks.nature_detection import (
@@ -28,14 +28,15 @@ from app.models.db import get_db
 
 DEFAULT_PORTS = (
     "21,22,23,25,53,80,110,143,161,443,445,993,995,"
-    "3000,3005,3006,3306,3389,5000,5432,5900,6379,8080,8291,8443,27017"
+    "3000,3005,3006,3306,3389,5000,5432,5900,6379,8080,8291,8443,8728,27017"
 )
 UDP_PORTS = "161,500,4500"
 
-LIKELY_REAL_PORTS = {80, 443, 8080, 8443}
+LIKELY_REAL_PORTS = {21, 22, 23, 25, 53, 80, 443, 8080, 8291, 8443, 8728}
 HTTP_PORTS = [80, 443, 3000, 3005, 3006, 5000, 8080, 8443]
 
 MASSCAN_BASE_RATE = "300"
+MASSCAN_WAIT_SECONDS = "5"
 JITTER_MIN_SECONDS = 0.3
 JITTER_MAX_SECONDS = 1.2
 CIRCUIT_BREAKER_THRESHOLD = 3
@@ -106,23 +107,40 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
     udp_ports = ports.get("udp", []) if isinstance(ports, dict) else []
 
     nmap_data = fingerprint_host(host_ip, tcp_ports)
+
+    # Pré-filtre : si Nmap n'a identifié aucun service sur un hôte
+    # avec beaucoup de ports, c'est un tarpit — skip immédiatement
+    # plutôt que de perdre 3+ minutes sur les probes réseau.
+    nmap_services = nmap_data.get("services", [])
+    if not nmap_services and len(tcp_ports) > 5:
+        print(f"[SKIP] {host_ip} — Nmap n'a identifié aucun service sur {len(tcp_ports)} ports")
+        return
+
     enriched = enrich_host(host_ip, nmap_data)
 
     web_target = domain or enriched.get("rdns") or host_ip
     services = enriched.get("services", nmap_data.get("services", []))
     services = _ensure_http_services_present(services, tcp_ports)
 
+    udp_service_map = {500: "isakmp", 4500: "isakmp", 161: "snmp"}
     for udp_port in udp_ports:
         if not any(s.get("port") == udp_port and s.get("protocol") == "udp" for s in services):
             services.append({
                 "port": udp_port, "protocol": "udp", "state": "open",
-                "service": "isakmp" if udp_port in (500, 4500) else "unknown",
+                "service": udp_service_map.get(udp_port, "unknown"),
                 "product": "", "version": "", "banner": "", "cves": [], "productConfirmed": False,
             })
 
     is_paas = _is_paas_hosting(enriched, services)
     os_value = None if is_paas else nmap_data.get("os")
 
+    # Sur un PaaS/CDN, seuls les ports HTTP et UDP sont pertinents.
+    if is_paas:
+        paas_filtered = [s for s in services if s.get("port") in HTTP_PORTS or s.get("protocol") == "udp"]
+        if paas_filtered:
+            services = paas_filtered
+
+    # ── Sondage de chaque service ──
     enriched_services = []
     for svc in services:
         port = svc.get("port")
@@ -169,7 +187,8 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
                 svc_http["cdnDetected"] = cdn_waf.get("cdnProvider")
                 svc_http["wafDetected"] = cdn_waf.get("wafProvider")
 
-                svc_devops = probe_devops_tool(base_url, svc_http.get("bodyPreview"), svc_http.get("headers"))
+                if not is_paas:
+                    svc_devops = probe_devops_tool(base_url, svc_http.get("bodyPreview"), svc_http.get("headers"))
 
         elif protocol == "tcp" and port == 21:
             svc_ftp = probe_ftp_anonymous(host_ip, port)
@@ -189,24 +208,50 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
         svc["dnsService"] = svc_dns_service
         svc["devopsTool"] = svc_devops
 
-        role_entries = derive_service_roles(svc, service_name, port)
-        svc["_roles"] = role_entries
-
         enriched_services.append(Asset.build_service(svc))
 
-    identity = resolve_asset_identity(enriched_services)
-    all_roles = [r for svc in enriched_services for r in svc.get("_roles", [])]
-    nature_roles, primary_role = derive_asset_roles(all_roles)
+    # ── Filtre : ne garder que les services avec au moins une donnée exploitable ──
+    enriched_services = [
+        svc for svc in enriched_services
+        if not (
+            not svc.get("product")
+            and not svc.get("banner")
+            and not (svc.get("http") or {}).get("statusCode")
+            and not (svc.get("tls") or {}).get("issuer")
+            and not (svc.get("snmp") or {}).get("sysDescr")
+            and not (svc.get("ftp") or {}).get("anonymousLoginAllowed")
+        )
+    ]
 
+    # Rien d'exploitable — ne pas persister cet hôte.
+    if not enriched_services:
+        print(f"[SKIP] {host_ip} — aucun service exploitable après filtrage")
+        return
+
+    # ── Rôles et identité calculés APRÈS le filtre ──
+    # Seuls les services qui ont survécu contribuent aux rôles et à l'identité.
+    final_role_entries = []
     for svc in enriched_services:
-        svc.pop("_roles", None)
+        final_role_entries.extend(
+            derive_service_roles(svc, svc.get("service", ""), svc.get("port", 0))
+        )
+
+    identity = resolve_asset_identity(enriched_services)
+    nature_roles, primary_role = derive_asset_roles(final_role_entries)
 
     auth_surfaces = _build_authentication_surfaces(enriched_services)
+
+    # ── Tags recalculés à partir des services retenus ──
+    filtered_tags = list({TAGS_MAP[svc["port"]] for svc in enriched_services if svc.get("port") in TAGS_MAP})
+    if is_paas:
+        filtered_tags.append("paas-hosting")
+    if all_hostnames_for_ip and len(all_hostnames_for_ip) > 1:
+        filtered_tags.append("shared-hosting")
 
     _save_asset(
         scan_id, host_ip, enriched_services, nmap_data, enriched,
         identity=identity, nature_roles=nature_roles, primary_role=primary_role,
-        auth_surfaces=auth_surfaces,
+        auth_surfaces=auth_surfaces, filtered_tags=filtered_tags,
         os_override=os_value, is_paas=is_paas,
         target_type=target_type, domain=domain, site_id=site_id, organization_id=organization_id,
         dns_data=dns_data, subdomains_discovered=subdomains_discovered,
@@ -252,6 +297,13 @@ def _build_authentication_surfaces(services):
                 "note": "protocole Winbox (MikroTik), authentification supposée",
             })
 
+        if port == 8728:
+            surfaces.append({
+                "port": port, "protocol": protocol, "method": "vendor_proprietary",
+                "confidence": "probable", "literalTextFound": [],
+                "note": "API RouterOS (MikroTik), authentification requise",
+            })
+
     return surfaces
 
 
@@ -266,7 +318,7 @@ def _run_masscan(cidr, ports, udp=False):
     out_file = tempfile.mktemp(suffix=".json")
     cmd = ["masscan", cidr]
     cmd += ["-pU:" + ports] if udp else ["-p", ports]
-    cmd += ["--rate", MASSCAN_BASE_RATE, "--output-format", "json", "--output-filename", out_file, "--wait", "1"]
+    cmd += ["--rate", MASSCAN_BASE_RATE, "--output-format", "json", "--output-filename", out_file, "--wait", MASSCAN_WAIT_SECONDS]
 
     print("[MASSCAN]", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -306,12 +358,6 @@ def _parse_masscan_output(filepath):
 
 
 def _merge_services(old_services: list, new_services: list) -> list:
-    """
-    Fusionne les services par (port, protocole) entre un scan précédent et
-    le nouveau, pour qu'un rescan partiel ou dégradé (ex: échec réseau
-    temporaire) n'efface jamais silencieusement une information déjà
-    obtenue lors d'un scan antérieur plus complet.
-    """
     old_by_port = {(s["port"], s["protocol"]): s for s in old_services}
     merged = []
 
@@ -347,7 +393,8 @@ def _merge_services(old_services: list, new_services: list) -> list:
 
 
 def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, nature_roles=None,
-                 primary_role="unknown", auth_surfaces=None, os_override=None, is_paas=False,
+                 primary_role="unknown", auth_surfaces=None, filtered_tags=None,
+                 os_override=None, is_paas=False,
                  target_type="cidr", domain=None, site_id=None, organization_id=None,
                  dns_data=None, subdomains_discovered=None, whois_domain=None, all_hostnames_for_ip=None):
     db = get_db()
@@ -367,10 +414,6 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
         if signals:
             attribution = {"guessedOrganizationName": whois_name or rdns, "confidence": "probable", "signals": signals}
 
-    # ── Identité stable de l'actif : (ipAddress, organizationId), plus scanId.
-    # Un rescan met à jour le même document au lieu d'en créer un nouveau ;
-    # deux scans différents qui retrouvent la même IP convergent aussi vers
-    # le même document, au lieu de produire des doublons. ──
     existing = db.assets.find_one({"ipAddress": ip, "organizationId": organization_id})
 
     if existing:
@@ -382,19 +425,22 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
             if primary_role == "unknown":
                 primary_role = existing.get("primaryRoleForDisplay", "unknown")
 
-    human_vector_exposed = any((svc.get("http") or {}).get("loginPoints") for svc in services)
+    human_vector_exposed = (
+        any((svc.get("http") or {}).get("loginPoints") for svc in services)
+        or "authentication_portal" in {r.get("role") for r in (nature_roles or [])}
+    )
 
     reasons = []
     if identity and identity.get("vendor"):
-        reasons.append(f"identifié comme {identity['vendor']}" + (f" {identity.get('model')}" if identity.get("model") else ""))
+        vendor_label = identity["vendor"]
+        if identity.get("model"):
+            vendor_label += f" {identity['model']}"
+        reasons.append(f"identifié comme {vendor_label}")
 
     risk_score, severity = calculate_risk_score(primary_role, Asset._derive_exposure(ip), services, human_vector_exposed, extra_reasons=reasons)
 
-    tags = list(enriched.get("tags", []))
-    if is_paas:
-        tags.append("paas-hosting")
-    if all_hostnames_for_ip and len(all_hostnames_for_ip) > 1:
-        tags.append("shared-hosting")
+    # Tags : utiliser les tags filtrés recalculés dans _process_host
+    tags = filtered_tags if filtered_tags is not None else list(enriched.get("tags", []))
 
     update_fields = {
         "organizationId": organization_id, "lastScanId": scan_id, "siteId": site_id,

@@ -51,9 +51,6 @@ def probe_smtp(ip: str, port: int = 25, timeout: int = 6) -> dict:
             auth_line = smtp.esmtp_features.get("auth", "")
             result["authMechanismsSupported"] = auth_line.split()
 
-        # Test de relais ouvert non destructif : tente un MAIL FROM / RCPT TO
-        # vers un domaine externe arbitraire, sans jamais envoyer DATA —
-        # on observe uniquement si le serveur accepte de relayer.
         try:
             smtp.mail("probe@example-antic-easm-test.invalid")
             code, _ = smtp.rcpt("probe-dest@example-antic-easm-test-external.invalid")
@@ -139,17 +136,6 @@ def probe_sensitive_files(base_url: str, timeout: int = 5) -> list:
 
 # ── CDN / WAF — pur pattern matching sur les en-têtes déjà récupérés ────
 
-CDN_HEADER_SIGNATURES = [
-    ("cf-ray", "Cloudflare"), ("server", "cloudflare", "Cloudflare"),
-    ("x-akamai", "Akamai"), ("x-amz-cf-id", "Amazon CloudFront"),
-    ("x-vercel-id", "Vercel"), ("x-fastly", "Fastly"),
-]
-
-WAF_HEADER_SIGNATURES = [
-    ("x-sucuri-id", "Sucuri"), ("x-waf-event-info", "Générique"),
-]
-
-
 def detect_cdn_waf_from_headers(headers: dict) -> dict:
     lowered_headers = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
 
@@ -172,36 +158,53 @@ def detect_cdn_waf_from_headers(headers: dict) -> dict:
 
 # ── Outils DevOps exposés ────────────────────────────────────────────────
 
-DEVOPS_PROBE_PATHS = [
-    ("/api/health", "grafana_or_generic"),
-    ("/login", None),  # déjà couvert par crawler, non redondant ici
-]
-
 DEVOPS_TOOL_SIGNATURES = [
     ("grafana", "grafana"), ("jenkins", "jenkins"),
     ("kubernetes", "kubernetes"), ("rabbitmq management", "rabbitmq"),
     ("kafka", "kafka"),
 ]
 
+# Contenu attendu dans une vraie page de statut nginx/haproxy
+NGINX_STATUS_MARKERS = ["active connections", "server accepts handled requests"]
+HAPROXY_STATUS_MARKERS = ["haproxy", "frontend", "backend"]
+
 
 def probe_devops_tool(base_url: str, homepage_body: str, homepage_headers: dict, timeout: int = 5) -> dict:
     """
     Détection par signature dans le contenu déjà récupéré (pas de requête
     réseau supplémentaire) + sondage de quelques chemins de statut connus.
+
+    IMPORTANT : ne pas appeler sur des hôtes PaaS/CDN — Vercel/Cloudflare
+    retournent 200 sur /nginx_status sans que ce soit un vrai statut nginx.
+    Le filtrage PaaS se fait dans _process_host, pas ici.
     """
     lowered_body = (homepage_body or "").lower()
     for keyword, tool_type in DEVOPS_TOOL_SIGNATURES:
         if keyword in lowered_body:
             return {"toolType": tool_type, "authRequired": None, "exposedInfoSummary": f"détecté via mot-clé '{keyword}' dans le contenu"}
 
-    for path, expected_hint in [("/nginx_status", "nginx"), ("/haproxy?stats", "haproxy")]:
-        try:
-            r = requests.get(base_url + path, timeout=timeout, verify=False)
-            if r.status_code == 200 and expected_hint:
+    # Sondage /nginx_status — vérifie que le contenu ressemble vraiment
+    # à une page de statut nginx, pas juste un 200 générique d'un CDN.
+    try:
+        r = requests.get(base_url + "/nginx_status", timeout=timeout, verify=False)
+        if r.status_code == 200:
+            body_lower = r.text.lower()
+            if any(marker in body_lower for marker in NGINX_STATUS_MARKERS):
                 return {"toolType": "loadbalancer_status", "authRequired": False,
-                         "exposedInfoSummary": f"page de statut accessible sur {path}"}
-        except Exception:
-            continue
+                         "exposedInfoSummary": "page de statut nginx accessible sur /nginx_status"}
+    except Exception:
+        pass
+
+    # Sondage /haproxy?stats
+    try:
+        r = requests.get(base_url + "/haproxy?stats", timeout=timeout, verify=False)
+        if r.status_code == 200:
+            body_lower = r.text.lower()
+            if any(marker in body_lower for marker in HAPROXY_STATUS_MARKERS):
+                return {"toolType": "loadbalancer_status", "authRequired": False,
+                         "exposedInfoSummary": "page de statut haproxy accessible sur /haproxy?stats"}
+    except Exception:
+        pass
 
     return None
 
