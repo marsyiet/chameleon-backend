@@ -12,6 +12,7 @@ contenu diffère réellement de ce qui a déjà été vu.
 """
 
 import hashlib
+import re
 import requests
 from bs4 import BeautifulSoup
 
@@ -45,7 +46,9 @@ API_CONTENT_MARKERS = [
     '"api"', "endpoint", "swagger", "openapi",
 ]
 
-# Frameworks connus pour servir des API (pas des pages web)
+# Frameworks connus pour servir des API (pas des pages web).
+# Utilisés uniquement en combinaison avec l'absence de <title> pour
+# éviter les faux positifs sur des frameworks fullstack (Next.js...).
 API_FRAMEWORK_SIGNATURES = [
     "express", "fastapi", "flask", "django rest framework",
     "koa", "hapi", "spring", "gin", "fiber",
@@ -79,6 +82,30 @@ def _normalize_zgrab_headers(zgrab_headers: dict) -> dict:
     return normalized
 
 
+def _extract_js_redirect(body: str) -> str:
+    """
+    Détecte les redirections JavaScript simples dans un body court
+    (window.location.href, window.location.replace, document.location).
+    Retourne le chemin cible ou None.
+    Cisco IOS-XE, certains équipements MikroTik et Fortinet utilisent
+    ce mécanisme pour renvoyer vers /webui, /webfig, /remote/login, etc.
+    """
+    if not body or len(body) > 800:
+        return None
+    patterns = [
+        r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        r"window\.location\.replace\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        r"document\.location\s*=\s*['\"]([^'\"]+)['\"]",
+        r"window\.location\s*=\s*['\"]([^'\"]+)['\"]",
+        r"url\s*=\s*['\"]([^'\"]+)['\"].*window\.location\.href\s*=\s*url",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, body, re.DOTALL)
+        if match:
+            return match.group(1)
+    return None
+
+
 def get_site_intelligence(target: str, port: int, use_https: bool,
                            homepage_body: str = None, homepage_status: int = None,
                            homepage_headers: dict = None) -> dict:
@@ -104,12 +131,24 @@ def get_site_intelligence(target: str, port: int, use_https: bool,
     homepage_hash = _body_hash(homepage_html) if homepage_html else None
 
     if homepage_html:
+        # Suivre les redirections JavaScript avant tout traitement —
+        # Cisco /webui, Fortinet /remote/login, etc.
+        js_redirect = _extract_js_redirect(homepage_html)
+        if js_redirect:
+            redirect_url = js_redirect if js_redirect.startswith("http") else f"{base_url.rstrip('/')}/{js_redirect.lstrip('/')}"
+            redirected_html, redirected_status, redirected_headers = _safe_get(redirect_url, return_headers=True)
+            if redirected_html and redirected_status == 200:
+                homepage_html = redirected_html
+                homepage_headers_final = redirected_headers or homepage_headers_final
+                homepage_hash = _body_hash(homepage_html)
+
         result["technologies"] = _detect_technologies(homepage_html, homepage_headers_final)
         result["pageTitle"] = _extract_title(homepage_html)
         result["metaDescription"] = _extract_meta_description(homepage_html)
 
         # Détection API par framework serveur (Express, FastAPI, Flask…)
-        # Un framework API sans <title> = probablement pas une page web
+        # Valide seulement si la page n'a pas de <title> — un framework
+        # fullstack comme Next.js sert aussi des pages web avec un titre.
         powered_by = homepage_headers_final.get("X-Powered-By", "").lower()
         server_header = homepage_headers_final.get("Server", "").lower()
         if any(fw in powered_by or fw in server_header for fw in API_FRAMEWORK_SIGNATURES):
@@ -206,15 +245,11 @@ def _looks_like_api_response(body: str, content_type: str) -> bool:
         if stripped.startswith("{") or stripped.startswith("["):
             return True
 
-        # 4. Body très court contenant "API" — typique d'un health check
+        # 4. Body très court contenant explicitement "api" — health check
         if len(stripped) < 100 and "api" in lowered:
             return True
 
-        # 5. Body court sans aucune balise HTML — texte brut, pas une page web
-        if len(stripped) < 200 and "<html" not in lowered and "<body" not in lowered and "<!doctype" not in lowered:
-            return True
-
-        # 6. Marqueurs API classiques dans un body court
+        # 5. Marqueurs API classiques dans un body court
         if any(marker in lowered for marker in API_CONTENT_MARKERS) and len(body) < 2000:
             return True
 

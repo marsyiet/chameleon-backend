@@ -48,6 +48,87 @@ PAAS_ASN_KEYWORDS = [
     "amazon", "google", "microsoft", "digitalocean", "heroku",
 ]
 
+# Opérateurs/hébergeurs dont le nom dans un subject TLS ou hostname
+# ne désigne PAS l'organisation finale exploitant le service.
+GENERIC_NETWORK_NAMES = [
+    "camtel", "orange", "mtn", "afrinic", "ripe", "arin", "apnic",
+    "letsencrypt", "cloudflare", "akamai", "fastly", "vercel",
+    "amazon", "google", "microsoft", "sectigo", "digicert",
+    "comodo", "globalstars",
+]
+
+
+def _is_generic_name(name: str) -> bool:
+    if not name:
+        return True
+    lowered = name.lower()
+    return any(g in lowered for g in GENERIC_NETWORK_NAMES)
+
+
+def _infer_owner_organization(services: list, enriched: dict, domain: str = None,
+                               target_organization_name: str = None) -> dict | None:
+    """
+    Infère l'organisation exploitant le service à partir de plusieurs sources,
+    par ordre décroissant de fiabilité. Distinct de l'attribution réseau
+    (propriétaire du bloc IP) qui reste dans le champ `attribution`.
+
+    Retourne un dict {name, source, confidence} ou None si rien de fiable.
+    """
+
+    # 1. Déclaration explicite (scan micro ciblé)
+    if target_organization_name:
+        return {"name": target_organization_name, "source": "declared", "confidence": "certaine"}
+
+    # 2. Certificat TLS — subject ou SANs
+    for svc in services:
+        tls = svc.get("tls") or {}
+        subject = (tls.get("subject") or "").strip()
+        if subject and not subject.startswith("*.") and not _is_generic_name(subject):
+            return {"name": subject, "source": "tls_subject", "confidence": "probable"}
+        # SANs : prend le premier qui ressemble à un domaine organisationnel
+        for san in (tls.get("san") or []):
+            san = san.strip()
+            if san and not san.startswith("*.") and not _is_generic_name(san):
+                return {"name": san, "source": "tls_san", "confidence": "probable"}
+
+    # 3. Hostname / rDNS significatif (pas juste l'IP inversée de l'opérateur)
+    rdns = enriched.get("rdns", "")
+    if rdns and not _is_generic_name(rdns):
+        return {"name": rdns, "source": "rdns", "confidence": "faible"}
+
+    if domain and not _is_generic_name(domain):
+        return {"name": domain, "source": "hostname", "confidence": "probable"}
+
+    # 4. Titre HTTP
+    for svc in services:
+        http = svc.get("http") or {}
+        title = (http.get("title") or "").strip()
+        if title and len(title) > 3 and not _is_generic_name(title):
+            return {"name": title, "source": "http_title", "confidence": "faible"}
+
+    # 5. Bannières FTP / SSH
+    for svc in services:
+        banner = (svc.get("banner") or "").strip()
+        if banner and not _is_generic_name(banner) and len(banner) > 5:
+            # On ne prend que la première ligne de la bannière
+            first_line = banner.splitlines()[0].strip()
+            if first_line and not _is_generic_name(first_line):
+                return {"name": first_line, "source": "banner", "confidence": "faible"}
+
+    # 6. sysName SNMP
+    for svc in services:
+        snmp = svc.get("snmp") or {}
+        sys_name = (snmp.get("sysName") or "").strip().strip('"')
+        if sys_name and not _is_generic_name(sys_name):
+            return {"name": sys_name, "source": "snmp_sysname", "confidence": "faible"}
+
+    # 7. WHOIS domaine (registrant) si différent des noms génériques réseau
+    whois_name = enriched.get("whois", {}).get("name")
+    if whois_name and not _is_generic_name(whois_name):
+        return {"name": whois_name, "source": "whois_ip", "confidence": "faible"}
+
+    return None
+
 
 def _filter_suspicious_ports(ip, ports, total_scanned):
     if total_scanned == 0:
@@ -108,9 +189,8 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
 
     nmap_data = fingerprint_host(host_ip, tcp_ports)
 
-    # Pré-filtre : si Nmap n'a identifié aucun service sur un hôte
-    # avec beaucoup de ports, c'est un tarpit — skip immédiatement
-    # plutôt que de perdre 3+ minutes sur les probes réseau.
+    # Pré-filtre : si Nmap n'a identifié aucun service sur un hôte avec
+    # beaucoup de ports, c'est un tarpit — skip immédiatement.
     nmap_services = nmap_data.get("services", [])
     if not nmap_services and len(tcp_ports) > 5:
         print(f"[SKIP] {host_ip} — Nmap n'a identifié aucun service sur {len(tcp_ports)} ports")
@@ -134,13 +214,11 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
     is_paas = _is_paas_hosting(enriched, services)
     os_value = None if is_paas else nmap_data.get("os")
 
-    # Sur un PaaS/CDN, seuls les ports HTTP et UDP sont pertinents.
     if is_paas:
         paas_filtered = [s for s in services if s.get("port") in HTTP_PORTS or s.get("protocol") == "udp"]
         if paas_filtered:
             services = paas_filtered
 
-    # ── Sondage de chaque service ──
     enriched_services = []
     for svc in services:
         port = svc.get("port")
@@ -223,13 +301,11 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
         )
     ]
 
-    # Rien d'exploitable — ne pas persister cet hôte.
     if not enriched_services:
         print(f"[SKIP] {host_ip} — aucun service exploitable après filtrage")
         return
 
-    # ── Rôles et identité calculés APRÈS le filtre ──
-    # Seuls les services qui ont survécu contribuent aux rôles et à l'identité.
+    # ── Rôles, identité et tags calculés APRÈS le filtre ──
     final_role_entries = []
     for svc in enriched_services:
         final_role_entries.extend(
@@ -238,20 +314,35 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
 
     identity = resolve_asset_identity(enriched_services)
     nature_roles, primary_role = derive_asset_roles(final_role_entries)
-
     auth_surfaces = _build_authentication_surfaces(enriched_services)
 
-    # ── Tags recalculés à partir des services retenus ──
     filtered_tags = list({TAGS_MAP[svc["port"]] for svc in enriched_services if svc.get("port") in TAGS_MAP})
     if is_paas:
         filtered_tags.append("paas-hosting")
     if all_hostnames_for_ip and len(all_hostnames_for_ip) > 1:
         filtered_tags.append("shared-hosting")
 
+    # ── Organisation exploitante (distinct du propriétaire réseau) ──
+    scan = None
+    try:
+        db = get_db()
+        scan = db.scans.find_one({"_id": ObjectId(scan_id)})
+    except Exception:
+        pass
+    target_organization_name = scan.get("targetOrganizationName") if scan else None
+
+    owner_organization = _infer_owner_organization(
+        services=enriched_services,
+        enriched=enriched,
+        domain=domain,
+        target_organization_name=target_organization_name,
+    )
+
     _save_asset(
         scan_id, host_ip, enriched_services, nmap_data, enriched,
         identity=identity, nature_roles=nature_roles, primary_role=primary_role,
         auth_surfaces=auth_surfaces, filtered_tags=filtered_tags,
+        owner_organization=owner_organization,
         os_override=os_value, is_paas=is_paas,
         target_type=target_type, domain=domain, site_id=site_id, organization_id=organization_id,
         dns_data=dns_data, subdomains_discovered=subdomains_discovered,
@@ -394,7 +485,7 @@ def _merge_services(old_services: list, new_services: list) -> list:
 
 def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, nature_roles=None,
                  primary_role="unknown", auth_surfaces=None, filtered_tags=None,
-                 os_override=None, is_paas=False,
+                 owner_organization=None, os_override=None, is_paas=False,
                  target_type="cidr", domain=None, site_id=None, organization_id=None,
                  dns_data=None, subdomains_discovered=None, whois_domain=None, all_hostnames_for_ip=None):
     db = get_db()
@@ -403,16 +494,25 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
     scan = db.scans.find_one({"_id": ObjectId(scan_id)})
     organization_id = organization_id or (scan.get("organizationId") if scan else None)
 
+    # ── Attribution réseau : propriétaire du bloc IP ──
     attribution = {"guessedOrganizationName": None, "confidence": "inconnue", "signals": []}
     target_organization_name = scan.get("targetOrganizationName") if scan else None
     if target_organization_name:
-        attribution = {"guessedOrganizationName": target_organization_name, "confidence": "certaine", "signals": ["declared"]}
+        attribution = {
+            "guessedOrganizationName": target_organization_name,
+            "confidence": "certaine",
+            "signals": ["declared"],
+        }
     else:
         whois_name = enriched.get("whois", {}).get("name")
         rdns = enriched.get("rdns", "")
         signals = [s for s, v in [("whois_org", whois_name), ("rdns", rdns)] if v]
         if signals:
-            attribution = {"guessedOrganizationName": whois_name or rdns, "confidence": "probable", "signals": signals}
+            attribution = {
+                "guessedOrganizationName": whois_name or rdns,
+                "confidence": "probable",
+                "signals": signals,
+            }
 
     existing = db.assets.find_one({"ipAddress": ip, "organizationId": organization_id})
 
@@ -424,6 +524,9 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
             nature_roles = nature_roles or existing["natureRoles"]
             if primary_role == "unknown":
                 primary_role = existing.get("primaryRoleForDisplay", "unknown")
+        # Conserver ownerOrganization existant si le nouveau scan n'a rien trouvé de mieux
+        if not owner_organization and existing.get("ownerOrganization"):
+            owner_organization = existing["ownerOrganization"]
 
     human_vector_exposed = (
         any((svc.get("http") or {}).get("loginPoints") for svc in services)
@@ -437,9 +540,10 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
             vendor_label += f" {identity['model']}"
         reasons.append(f"identifié comme {vendor_label}")
 
-    risk_score, severity = calculate_risk_score(primary_role, Asset._derive_exposure(ip), services, human_vector_exposed, extra_reasons=reasons)
+    risk_score, severity = calculate_risk_score(
+        primary_role, Asset._derive_exposure(ip), services, human_vector_exposed, extra_reasons=reasons
+    )
 
-    # Tags : utiliser les tags filtrés recalculés dans _process_host
     tags = filtered_tags if filtered_tags is not None else list(enriched.get("tags", []))
 
     update_fields = {
@@ -448,13 +552,17 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
         "identity": identity or {},
         "natureRoles": nature_roles or [], "primaryRoleForDisplay": primary_role,
         "exposure": Asset._derive_exposure(ip),
-        "humanVector": {"exposed": human_vector_exposed, "matchedAt": now if human_vector_exposed else None,
-                         "source": "crawler" if human_vector_exposed else None},
+        "humanVector": {
+            "exposed": human_vector_exposed,
+            "matchedAt": now if human_vector_exposed else None,
+            "source": "crawler" if human_vector_exposed else None,
+        },
         "severity": severity, "riskScore": risk_score, "services": services,
         "os": os_override if os_override is not None else nmap_data.get("os"),
         "geo": enriched.get("geo", {}), "asn": enriched.get("asn", {}), "bgp": enriched.get("bgp", {}),
         "rdns": enriched.get("rdns", ""), "attribution": attribution, "tags": tags,
         "authenticationSurfaces": auth_surfaces or [],
+        "ownerOrganization": owner_organization,
         "lastSeenAt": now, "isDeleted": False, "deletedAt": None, "updatedAt": now,
     }
 
