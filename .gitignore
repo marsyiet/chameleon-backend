@@ -1,0 +1,7 @@
+mongosh-2.3.0-linux-x64/
+*.tgz
+venv/
+.env
+__pycache__/
+*.pyc
+backup/
