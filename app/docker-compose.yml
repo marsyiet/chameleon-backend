@@ -1,7 +1,7 @@
 version: "3.9"
- 
+
 services:
- 
+
   api:
     build:
       context: .
@@ -11,9 +11,10 @@ services:
     env_file: .env
     depends_on:
       - redis
+      - mongo
     volumes:
       - .:/app
- 
+
   worker:
     build:
       context: .
@@ -21,6 +22,7 @@ services:
     env_file: .env
     depends_on:
       - redis
+      - mongo
     cap_add:
       - NET_RAW      # obligatoire pour Masscan (raw sockets)
       - NET_ADMIN
@@ -28,14 +30,21 @@ services:
     volumes:
       - .:/app
       - /opt/geoip:/opt/geoip:ro  # base GeoLite2 en lecture seule
- 
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
- 
+
   flower:    # Dashboard de monitoring Celery
     image: mher/flower:2.0.0
     ports:
@@ -43,6 +52,7 @@ services:
     command: celery --broker=redis://redis:6379/0 flower
     depends_on:
       - redis
- 
+
 volumes:
   redis_data:
+  mongo_data:
