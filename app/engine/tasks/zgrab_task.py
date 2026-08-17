@@ -108,6 +108,47 @@ def zgrab_tls(target: str, port: int) -> dict:
         return {}
 
 
+def zgrab_ssh(target: str, port: int = 22) -> dict:
+    """
+    Récupère la bannière de version SSH et les paramètres négociés
+    (algorithme de clé hôte, chiffrement) sans authentification — cette
+    partie de l'échange SSH est envoyée par le serveur à toute connexion,
+    avant toute tentative de login.
+    """
+    try:
+        cmd = [
+            "zgrab2",
+            "ssh",
+            "--port", str(port),
+            "--client-id", "ANTIC-EASM_1.0",
+            "--connect-timeout", "10s",
+        ]
+        result = subprocess.run(
+            cmd, input=target, text=True, capture_output=True, timeout=20,
+        )
+        if result.returncode != 0:
+            print("[ZGRAB SSH NONZERO EXIT]", result.returncode, result.stderr[:300])
+            return {}
+        lines = result.stdout.strip().splitlines()
+        if not lines:
+            return {}
+        data = json.loads(lines[0])
+        ssh_result = data.get("data", {}).get("ssh", {}).get("result", {})
+        server_id = ssh_result.get("server_id", {})
+        algos = ssh_result.get("algorithm_selection", {})
+
+        return {
+            "banner": server_id.get("raw"),
+            "protocolVersion": server_id.get("version"),
+            "softwareVersion": server_id.get("software"),
+            "hostKeyAlgorithm": algos.get("host_key_algorithm"),
+            "encryptionAlgorithm": algos.get("client_to_server_alg_group", {}).get("cipher"),
+        }
+    except Exception as e:
+        print("[ZGRAB SSH ERROR]", e)
+        return {}
+
+
 def fetch_favicon(target: str, port: int, use_https: bool) -> dict:
     scheme = "https" if use_https else "http"
     url = f"{scheme}://{target}:{port}/favicon.ico"

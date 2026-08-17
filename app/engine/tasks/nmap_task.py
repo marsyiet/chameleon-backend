@@ -16,7 +16,8 @@ def fingerprint_host(host: str, ports: list) -> dict:
         "-Pn",
         "-sV",
         "-sC",
-        "--script", "mysql-info,pgsql-brute,mongodb-databases,redis-info",
+        "--script", "banner,mysql-info,pgsql-brute,mongodb-databases,redis-info",
+        "--script-args", "banner.timeout=10s",
         "-O",
         "--open",
         "-T4",
@@ -48,6 +49,21 @@ def fingerprint_host(host: str, ports: list) -> dict:
     return _parse_nmap_xml(result.stdout)
 
 
+def _strip_telnet_negotiation(raw: str) -> str:
+    """
+    Nmap échappe les octets non imprimables (négociation IAC Telnet, RFC 854)
+    en texte littéral "\\xHH" dans sa sortie XML, car le XML ne peut pas
+    contenir de caractères de contrôle bruts. Cette fonction retire ces
+    séquences échappées — sans ce nettoyage, le texte littéral "\\xFF\\xFB..."
+    pollue la bannière stockée et tout ce qui en dépend (attribution par
+    bannière, affichage frontend).
+    """
+    if not raw:
+        return raw
+    cleaned = re.sub(r"(?:\\x[0-9A-Fa-f]{2})+", " ", raw)
+    return cleaned.strip()
+
+
 def _parse_nmap_xml(xml_output: str) -> dict:
     try:
         from libnmap.parser import NmapParser
@@ -66,6 +82,19 @@ def _parse_nmap_xml(xml_output: str) -> dict:
             banner  = svc.service_dict.get("extrainfo", "")
 
             version = version.replace("for_Windows_", "")
+
+            # Récupère le résultat du script NSE "banner" (forcé via --script),
+            # qui capture le texte brut renvoyé par le service à la connexion —
+            # essentiel pour Telnet, SSH et tout service texte, où extrainfo
+            # de Nmap reste souvent vide ou tronqué. Ne remplace jamais une
+            # bannière déjà trouvée par extrainfo.
+            if svc.scripts_results:
+                for script in svc.scripts_results:
+                    if script.get("id") == "banner":
+                        raw_banner = _strip_telnet_negotiation(script.get("output", ""))
+                        if raw_banner and not banner:
+                            banner = raw_banner
+                        break
 
             if not product and svc.scripts_results:
                 for script in svc.scripts_results:

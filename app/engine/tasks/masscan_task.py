@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import subprocess
 import tempfile
 import time
@@ -10,7 +11,7 @@ from bson import ObjectId
 
 from app.engine.tasks.nmap_task import fingerprint_host
 from app.engine.tasks.enrichment import enrich_host, TAGS_MAP
-from app.engine.tasks.zgrab_task import zgrab_http, zgrab_tls, fetch_favicon
+from app.engine.tasks.zgrab_task import zgrab_http, zgrab_tls, fetch_favicon, zgrab_ssh
 from app.engine.tasks.crawler_task import get_site_intelligence
 from app.engine.tasks.nature_detection import (
     derive_service_roles, resolve_asset_identity, derive_asset_roles,
@@ -21,6 +22,7 @@ from app.engine.tasks.protocol_probes import (
     probe_ftp_anonymous, probe_smtp, probe_dns_service,
     probe_http_methods_and_cors, probe_sensitive_files,
     detect_cdn_waf_from_headers, probe_devops_tool,
+    probe_vnc, probe_rdp_nla, probe_telnet_banner,
 )
 from app.engine.scoring import calculate_risk_score
 from app.models.asset import Asset
@@ -56,6 +58,23 @@ GENERIC_NETWORK_NAMES = [
     "amazon", "google", "microsoft", "sectigo", "digicert",
     "comodo", "globalstars",
 ]
+
+
+# Motifs purement techniques/protocolaires — jamais un nom d'organisation,
+# même s'ils apparaissent en première ligne d'une bannière SSH/Telnet.
+BANNER_NOISE_PATTERNS = [
+    r"^protocol\s+[\d.]+$",
+    r"^ssh-[\d.]+",
+    r"^\d+\.\d+$",
+    r"^[-=_~*#]{3,}$",
+]
+
+
+def _is_banner_noise(text: str) -> bool:
+    if not text:
+        return True
+    lowered = text.strip().lower()
+    return any(re.match(p, lowered) for p in BANNER_NOISE_PATTERNS)
 
 
 def _is_generic_name(name: str) -> bool:
@@ -106,13 +125,18 @@ def _infer_owner_organization(services: list, enriched: dict, domain: str = None
         if title and len(title) > 3 and not _is_generic_name(title):
             return {"name": title, "source": "http_title", "confidence": "faible"}
 
-    # 5. Bannières FTP / SSH
+    # 5. Bannières FTP uniquement — un message de bienvenue FTP est parfois
+    # personnalisé par l'organisation qui l'exploite. Une bannière SSH/Telnet
+    # est presque toujours un texte générique du vendeur de l'équipement
+    # (ex: message Cisco CP identique sur tous les routeurs Cisco non
+    # reconfigurés), donc jamais un signal fiable d'organisation exploitante.
     for svc in services:
+        if svc.get("service") != "ftp":
+            continue
         banner = (svc.get("banner") or "").strip()
         if banner and not _is_generic_name(banner) and len(banner) > 5:
-            # On ne prend que la première ligne de la bannière
             first_line = banner.splitlines()[0].strip()
-            if first_line and not _is_generic_name(first_line):
+            if first_line and not _is_generic_name(first_line) and not _is_banner_noise(first_line):
                 return {"name": first_line, "source": "banner", "confidence": "faible"}
 
     # 6. sysName SNMP
@@ -225,9 +249,8 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
         protocol = svc.get("protocol")
         service_name = svc.get("service")
 
-        banner_parsed = parse_banner(svc.get("banner", ""), protocol_hint=service_name)
-
         svc_http, svc_tls, svc_snmp, svc_ftp, svc_mail, svc_dns_service, svc_devops = (None,) * 7
+        svc_ssh, svc_vnc, svc_rdp = None, None, None
 
         if protocol == "tcp" and port in HTTP_PORTS:
             use_https = port in (443, 8443)
@@ -270,12 +293,27 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
 
         elif protocol == "tcp" and port == 21:
             svc_ftp = probe_ftp_anonymous(host_ip, port)
+        elif protocol == "tcp" and port == 22:
+            svc_ssh = zgrab_ssh(web_target, port)
+        elif protocol == "tcp" and port == 23:
+            telnet_result = probe_telnet_banner(host_ip, port)
+            if telnet_result.get("banner"):
+                svc["banner"] = telnet_result["banner"]
         elif protocol == "tcp" and port == 25:
             svc_mail = probe_smtp(host_ip, port)
+        elif protocol == "tcp" and port == 3389:
+            svc_rdp = probe_rdp_nla(host_ip, port)
+        elif protocol == "tcp" and port == 5900:
+            svc_vnc = probe_vnc(host_ip, port)
         elif protocol == "udp" and port == 161:
             svc_snmp = query_snmp(host_ip)
         elif port == 53:
             svc_dns_service = probe_dns_service(host_ip)
+
+        # Calculé après le bloc if/elif : port 23 peut avoir remplacé
+        # svc["banner"] par la réponse Telnet complète (probe_telnet_banner),
+        # au-delà de ce que le script "banner" de Nmap capture par défaut.
+        banner_parsed = parse_banner(svc.get("banner", ""), protocol_hint=service_name)
 
         svc["bannerParsed"] = banner_parsed
         svc["http"] = svc_http
@@ -285,6 +323,9 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
         svc["mail"] = svc_mail
         svc["dnsService"] = svc_dns_service
         svc["devopsTool"] = svc_devops
+        svc["ssh"] = svc_ssh
+        svc["vnc"] = svc_vnc
+        svc["rdp"] = svc_rdp
 
         enriched_services.append(Asset.build_service(svc))
 
@@ -298,6 +339,9 @@ def _process_host(scan_id, host_ip, ports, target_type, domain, site_id, organiz
             and not (svc.get("tls") or {}).get("issuer")
             and not (svc.get("snmp") or {}).get("sysDescr")
             and not (svc.get("ftp") or {}).get("anonymousLoginAllowed")
+            and not (svc.get("ssh") or {}).get("banner")
+            and not (svc.get("vnc") or {}).get("protocolVersion")
+            and (svc.get("rdp") or {}).get("nlaRequired") is None
         )
     ]
 
@@ -381,6 +425,27 @@ def _build_authentication_surfaces(services):
                 "note": "authentification FTP requise (accès anonyme refusé)",
             })
 
+        vnc = svc.get("vnc")
+        if vnc and vnc.get("protocolVersion"):
+            no_auth = vnc.get("noAuthPossible")
+            surfaces.append({
+                "port": port, "protocol": protocol, "method": "vnc_auth",
+                "confidence": "certaine" if no_auth is not None else "probable",
+                "literalTextFound": [],
+                "note": "VNC sans authentification requise" if no_auth
+                        else "authentification VNC requise",
+            })
+
+        rdp = svc.get("rdp")
+        if rdp and rdp.get("nlaRequired") is not None:
+            surfaces.append({
+                "port": port, "protocol": protocol, "method": "rdp_login",
+                "confidence": "certaine",
+                "literalTextFound": [],
+                "note": "NLA activé (authentification pré-session)" if rdp.get("nlaRequired")
+                        else "NLA non activé — écran de connexion atteignable avant authentification",
+            })
+
         if port == 8291:
             surfaces.append({
                 "port": port, "protocol": protocol, "method": "vendor_proprietary",
@@ -462,7 +527,7 @@ def _merge_services(old_services: list, new_services: list) -> list:
 
         combined = dict(new_svc)
 
-        for field in ["http", "tls", "snmp", "ftp", "mail", "dnsService", "devopsTool", "bannerParsed"]:
+        for field in ["http", "tls", "snmp", "ftp", "mail", "dnsService", "devopsTool", "bannerParsed", "ssh", "vnc", "rdp"]:
             new_value = new_svc.get(field)
             old_value = old_svc.get(field)
             if not new_value and old_value:
@@ -506,10 +571,11 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
     else:
         whois_name = enriched.get("whois", {}).get("name")
         rdns = enriched.get("rdns", "")
-        signals = [s for s, v in [("whois_org", whois_name), ("rdns", rdns)] if v]
+        asn_org = enriched.get("asn", {}).get("org")
+        signals = [s for s, v in [("whois_org", whois_name), ("rdns", rdns), ("asn_org", asn_org)] if v]
         if signals:
             attribution = {
-                "guessedOrganizationName": whois_name or rdns,
+                "guessedOrganizationName": whois_name or rdns or asn_org,
                 "confidence": "probable",
                 "signals": signals,
             }

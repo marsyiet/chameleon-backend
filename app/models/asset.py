@@ -139,10 +139,10 @@ class Asset:
     @staticmethod
     def build_service(data):
         """
-        `http`/`tls`/`snmp`/`ftp`/`mail`/`dnsService`/`iot`/`ics`/`devopsTool`
-        sont imbriqués ici (par service), plus au niveau racine de l'actif —
-        évite qu'un actif avec plusieurs services HTTP voie un service
-        écraser les données d'un autre.
+        `http`/`tls`/`snmp`/`ftp`/`mail`/`dnsService`/`iot`/`ics`/`devopsTool`/
+        `ssh`/`vnc`/`rdp` sont imbriqués ici (par service), plus au niveau
+        racine de l'actif — évite qu'un actif avec plusieurs services HTTP
+        voie un service écraser les données d'un autre.
         """
         return {
             "port": data["port"],
@@ -168,4 +168,7 @@ class Asset:
             "iot": data.get("iot"),
             "ics": data.get("ics"),
             "devopsTool": data.get("devopsTool"),
+            "ssh": data.get("ssh"),
+            "vnc": data.get("vnc"),
+            "rdp": data.get("rdp"),
         }

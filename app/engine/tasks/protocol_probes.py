@@ -4,6 +4,7 @@ uniquement des connexions socket/HTTP que le pipeline effectue lui-même.
 """
 
 import socket
+import re
 import ftplib
 import smtplib
 import ssl
@@ -207,6 +208,118 @@ def probe_devops_tool(base_url: str, homepage_body: str, homepage_headers: dict,
         pass
 
     return None
+
+
+# ── VNC ──────────────────────────────────────────────────────────────────
+
+# Types de sécurité définis par le protocole RFB (VNC). Le type 1 ("none")
+# signifie qu'un client peut se connecter sans authentification aucune.
+VNC_SECURITY_TYPES = {
+    1: "none",
+    2: "vnc_auth",
+    5: "ra2",
+    6: "ra2ne",
+    16: "tight",
+    18: "tls",
+    19: "vencrypt",
+}
+
+
+def probe_vnc(ip: str, port: int = 5900, timeout: int = 5) -> dict:
+    """
+    Lit la négociation initiale du protocole RFB (VNC) : version de
+    protocole annoncée par le serveur, puis liste des types de sécurité
+    proposés. Ne complète jamais l'authentification, ne transmet aucun
+    identifiant — uniquement la phase de négociation, qui a lieu avant
+    tout contrôle d'accès.
+    """
+    result = {"protocolVersion": None, "securityTypesOffered": [], "noAuthPossible": None}
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+
+        version_line = sock.recv(12)
+        if version_line.startswith(b"RFB "):
+            result["protocolVersion"] = version_line.decode(errors="ignore").strip()
+            # Renvoie la même version pour poursuivre la négociation standard
+            sock.sendall(version_line)
+
+            num_types_byte = sock.recv(1)
+            if num_types_byte:
+                num_types = num_types_byte[0]
+                if num_types > 0:
+                    types_raw = sock.recv(num_types)
+                    result["securityTypesOffered"] = [
+                        VNC_SECURITY_TYPES.get(t, f"unknown({t})") for t in types_raw
+                    ]
+                    result["noAuthPossible"] = 1 in types_raw
+        sock.close()
+    except Exception as e:
+        print("[VNC PROBE ERROR]", ip, e)
+    return result
+
+
+# ── RDP ──────────────────────────────────────────────────────────────────
+
+def probe_rdp_nla(ip: str, port: int = 3389, timeout: int = 5) -> dict:
+    """
+    Envoie une requête de négociation RDP (X.224 Connection Request) et lit
+    si le serveur exige NLA (Network Level Authentication). Un serveur RDP
+    sans NLA laisse l'écran de connexion Windows atteignable avant tout
+    contrôle d'accès, ce qui constitue une surface d'authentification plus
+    exposée qu'un serveur imposant NLA en amont.
+    """
+    result = {"nlaRequired": None}
+    x224_request = bytes.fromhex(
+        "030000130ee000000000000100080003000000"
+    )
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(x224_request)
+        response = sock.recv(19)
+        sock.close()
+
+        if len(response) >= 19 and response[5] == 0xd0:
+            flags = response[15] if len(response) > 15 else 0
+            result["nlaRequired"] = bool(flags & 0x02)
+    except Exception as e:
+        print("[RDP PROBE ERROR]", ip, e)
+    return result
+
+
+# ── Telnet ───────────────────────────────────────────────────────────────
+
+def probe_telnet_banner(ip: str, port: int = 23, timeout: int = 6, max_bytes: int = 4096) -> dict:
+    """
+    Se connecte en Telnet et lit la réponse complète après la négociation
+    IAC, plutôt que de dépendre du script 'banner' de Nmap qui ne capture
+    souvent que les premiers octets — occupés en intégralité par la
+    négociation sur ce protocole, laissant peu ou rien d'exploitable une
+    fois cette négociation retirée du texte.
+    """
+    result = {"banner": None}
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        data = b""
+        try:
+            while len(data) < max_bytes:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                sock.settimeout(1.5)
+        except socket.timeout:
+            pass
+        sock.close()
+
+        cleaned = re.sub(rb"\xff[\xfb-\xfe].", b"", data)
+        text = cleaned.decode("utf-8", errors="ignore").strip()
+        result["banner"] = text or None
+    except Exception as e:
+        print("[TELNET PROBE ERROR]", ip, e)
+    return result
 
 
 # ── Risque de subdomain takeover ─────────────────────────────────────────
