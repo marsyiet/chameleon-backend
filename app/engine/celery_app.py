@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from app.config.config import config
 
 def create_celery_app() -> Celery:
@@ -16,6 +17,7 @@ def create_celery_app() -> Celery:
             "app.engine.tasks.nmap_task",
             "app.engine.tasks.zgrab_task",
             "app.engine.tasks.enrichment",
+            "app.engine.tasks.rescan_task",
         ]
     )
 
@@ -31,6 +33,16 @@ def create_celery_app() -> Celery:
         result_expires=86400,
         worker_concurrency=4,
     )
+
+    # Vérifie toutes les heures s'il existe des planifications de scan
+    # arrivées à échéance. Nécessite un processus Celery Beat séparé :
+    #   celery -A app.engine.celery_app beat --loglevel=info
+    app.conf.beat_schedule = {
+        "check-due-rescans": {
+            "task": "engine.tasks.rescan_task.check_due_rescans",
+            "schedule": crontab(minute=0),
+        },
+    }
 
     return app
 

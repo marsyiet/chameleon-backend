@@ -25,6 +25,7 @@ from app.engine.tasks.protocol_probes import (
     probe_vnc, probe_rdp_nla, probe_telnet_banner,
 )
 from app.engine.scoring import calculate_risk_score
+from app.engine.change_detection import compare_asset_versions, record_asset_changes
 from app.models.asset import Asset
 from app.models.db import get_db
 
@@ -609,6 +610,20 @@ def _save_asset(scan_id, ip, services, nmap_data, enriched, identity=None, natur
     risk_score, severity = calculate_risk_score(
         primary_role, Asset._derive_exposure(ip), services, human_vector_exposed, extra_reasons=reasons
     )
+
+    # ── Détection de changements majeurs (uniquement si l'actif était déjà connu) ──
+    if existing:
+        new_state = {
+            "services": services,
+            "severity": severity,
+            "riskScore": risk_score,
+            "primaryRoleForDisplay": primary_role,
+            "authenticationSurfaces": auth_surfaces or [],
+        }
+        changes = compare_asset_versions(existing, new_state)
+        record_asset_changes(
+            db, existing["_id"], ip, organization_id, scan_id, changes,
+        )
 
     tags = filtered_tags if filtered_tags is not None else list(enriched.get("tags", []))
 

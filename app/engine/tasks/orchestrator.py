@@ -7,6 +7,12 @@ from app.engine.tasks.nmap_task import scan_domain
 from app.engine.tasks.correlation_task import compute_correlations_for_scan
 from app.models.db import get_db
 
+# Seuils au-delà desquels une variation du nombre d'actifs découverts est
+# jugée significative — en-dessous, la fluctuation est considérée comme du
+# bruit normal (un hôte injoignable ponctuellement, par exemple).
+ASSET_COUNT_ABSOLUTE_THRESHOLD = 2
+ASSET_COUNT_RELATIVE_THRESHOLD = 0.20  # 20 %
+
 
 @celery_app.task(bind=True, name="engine.orchestrator.dispatch_scan")
 def dispatch_scan(self, scan_id: str):
@@ -82,6 +88,16 @@ def dispatch_scan(self, scan_id: str):
         print(f"[CORRELATION ERROR] scan_id={scan_id} error={e}")
         print(traceback.format_exc())
 
+    final_scan = db.scans.find_one({"_id": ObjectId(scan_id)})
+    assets_discovered = final_scan.get("assetsDiscovered", 0)
+
+    try:
+        _check_asset_count_variation(db, scan, scan_id, assets_discovered)
+    except Exception as e:
+        import traceback
+        print(f"[ASSET COUNT CHECK ERROR] scan_id={scan_id} error={e}")
+        print(traceback.format_exc())
+
     db.scans.update_one(
         {"_id": ObjectId(scan_id)},
         {"$set": {
@@ -89,4 +105,67 @@ def dispatch_scan(self, scan_id: str):
             "completedAt": datetime.now(timezone.utc),
             "progress": 100
         }}
+    )
+
+
+def _check_asset_count_variation(db, scan: dict, scan_id: str, assets_discovered: int):
+    """
+    Compare le nombre d'actifs découverts par ce scan au dernier scan
+    précédent portant sur le même périmètre (mêmes cibles), et enregistre
+    un changement si la variation dépasse les seuils définis — trop
+    d'actifs en plus peut signaler une expansion d'infrastructure non
+    documentée (shadow IT), trop peu peut signaler une indisponibilité
+    ou un problème de couverture du scan lui-même.
+    """
+    target_values = sorted(t["target"] for t in scan.get("targets", []))
+
+    previous_scan = db.scans.find_one(
+        {
+            "_id": {"$ne": ObjectId(scan_id)},
+            "organizationId": scan.get("organizationId"),
+            "targetOrganizationId": scan.get("targetOrganizationId"),
+            "status": "completed",
+            "isDeleted": False,
+        },
+        sort=[("completedAt", -1)],
+    )
+
+    if not previous_scan:
+        return  # premier scan sur ce périmètre, rien à comparer
+
+    previous_targets = sorted(t["target"] for t in previous_scan.get("targets", []))
+    if previous_targets != target_values:
+        return  # périmètre différent, comparaison non pertinente
+
+    previous_count = previous_scan.get("assetsDiscovered", 0)
+    delta = assets_discovered - previous_count
+
+    if previous_count == 0:
+        is_significant = assets_discovered > 0
+    else:
+        relative_delta = abs(delta) / previous_count
+        is_significant = (
+            abs(delta) >= ASSET_COUNT_ABSOLUTE_THRESHOLD
+            and relative_delta >= ASSET_COUNT_RELATIVE_THRESHOLD
+        )
+
+    if not is_significant:
+        return
+
+    direction = "en hausse" if delta > 0 else "en baisse"
+    change = {
+        "type": "asset_count_variation",
+        "summary": f"Nombre d'actifs découverts {direction} : {previous_count} → {assets_discovered}",
+        "field": "assetsDiscovered",
+        "oldValue": previous_count,
+        "newValue": assets_discovered,
+    }
+
+    record_asset_changes(
+        db,
+        asset_id=None,
+        ip_address=None,
+        organization_id=scan.get("targetOrganizationId") or scan.get("organizationId"),
+        scan_id=scan_id,
+        changes=[change],
     )

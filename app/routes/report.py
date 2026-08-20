@@ -19,7 +19,7 @@ from app.engine.report_pdf import build_asset_report_pdf
 report_bp = Blueprint("report", __name__)
 
 
-@report_bp.route("/api/assets/<asset_id>/report", methods=["GET"])
+@report_bp.route("/<asset_id>/report", methods=["GET"])
 def download_asset_report(asset_id):
     db = get_db()
 
